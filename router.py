@@ -22,6 +22,7 @@ Usage:
   router.py --prompt "..." --ollama-model qwen2.5:latest --timeout 15
   router.py --prompt "..." --explain   # prints picked id + reason to stderr
   router.py --prompt "..." --dry-run   # don't print id to stdout
+  router.py --prompt "..." --no-fastpath   # skip regex fast-path, force Ollama
   router.py --validate                 # check every ladder id exists in cursor-models.tsv
 
   # Planner mode: decompose a prompt into tasks + a wave-ordered DAG.
@@ -39,6 +40,8 @@ Env:
   ROUTER_CATALOGUE_FILE (default <script_dir>/cursor-models.tsv)
   ROUTER_LOG_FILE       (default <script_dir>/router.log)
   ROUTER_PLAN_LOG_FILE  (default <script_dir>/plan.log)
+  ROUTER_FASTPATH       (default 1) — 0 disables regex intent fast-path
+  ROUTER_FASTPATH_FILE  (default <script_dir>/fastpath.yaml) — regex rules
   ROUTER_CACHE_DIR      (default <script_dir>/.cache) — prompt → decision cache
   ROUTER_CACHE_TTL_SEC  (default 604800, one week) — 0 disables cache entirely
   ROUTER_JUDGE_SAMPLE   (default 0.0) — fraction [0,1] of completed runs to
@@ -130,6 +133,109 @@ def cache_put(namespace: str, key: str, value: dict) -> None:
         tmp.replace(d / f"{key}.json")
     except OSError:
         pass
+
+# ---------------------------------------------------------------------------
+# Intent-classifier fast-path.
+#
+# Before calling the Ollama classifier, try to match the prompt against a
+# small list of high-confidence regex shortcuts (fastpath.yaml). On a match
+# we skip the LLM entirely: (bucket, latency, effort) are taken from the
+# matching rule, and resolve_id() turns that into a Cursor model id as usual.
+#
+# Design rules (enforced by convention, not by code):
+#
+#   1. Rules must be UNAMBIGUOUS. If the same prompt could reasonably want
+#      a different bucket, the rule does NOT belong here — let the
+#      classifier decide.
+#   2. Rules are CONSERVATIVE. We always pick the cheapest defensible
+#      bucket. Undershooting on the fast-path is recoverable (the agent
+#      produces a fast-but-fine answer); overshooting wastes money
+#      silently and never gets corrected.
+#   3. Keep the list SMALL (< 25 rules). At any larger size you've written
+#      a bad hand-rolled classifier — use the real one instead.
+#
+# Matches are cached by the same prompt-cache machinery as Ollama decisions,
+# so a repeated fast-path prompt skips even the regex walk on the second
+# call.
+# ---------------------------------------------------------------------------
+
+def _fastpath_enabled() -> bool:
+    return os.environ.get("ROUTER_FASTPATH", "1") != "0"
+
+
+_FASTPATH_CACHE: tuple[list[tuple[str, re.Pattern, dict]], float] | None = None
+
+
+def load_fastpath(path: Path) -> list[tuple[str, re.Pattern, dict]]:
+    """
+    Load and compile fastpath rules. Returns a list of
+    (rule_id, compiled_regex, decision_dict). Returns [] if the file is
+    missing, malformed, or contains no valid rules — fast-path simply
+    becomes a no-op in that case.
+
+    Re-reads + recompiles if the file's mtime changes so edits take effect
+    without a restart.
+    """
+    global _FASTPATH_CACHE
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        _FASTPATH_CACHE = None
+        return []
+    if _FASTPATH_CACHE is not None and _FASTPATH_CACHE[1] == mtime:
+        return _FASTPATH_CACHE[0]
+
+    try:
+        cfg = load_yaml_simple(path)
+    except (OSError, ValueError):
+        _FASTPATH_CACHE = ([], mtime)
+        return []
+
+    compiled: list[tuple[str, re.Pattern, dict]] = []
+    for r in cfg.get("rules") or []:
+        rid = str(r.get("id") or "").strip()
+        pat = r.get("pattern")
+        bucket = r.get("bucket")
+        if not rid or not isinstance(pat, str) or not bucket:
+            continue
+        try:
+            rx = re.compile(pat, re.IGNORECASE)
+        except re.error:
+            # A broken rule shouldn't silently disable the whole file.
+            # Skip just this one.
+            continue
+        latency = r.get("latency", "normal")
+        if latency not in ("fast", "normal"):
+            latency = "normal"
+        effort = r.get("effort", "normal")
+        if effort not in ("normal", "high", "max"):
+            effort = "normal"
+        compiled.append((rid, rx, {
+            "bucket": str(bucket),
+            "latency": latency,
+            "effort": effort,
+            "reason": f"fastpath:{rid}",
+        }))
+
+    _FASTPATH_CACHE = (compiled, mtime)
+    return compiled
+
+
+def try_fastpath(prompt: str, rules: list[tuple[str, re.Pattern, dict]]) -> tuple[dict | None, str | None]:
+    """
+    Walk rules top-to-bottom, return (decision, rule_id) on first match,
+    (None, None) on no match. We strip the prompt because many real prompts
+    have leading/trailing whitespace from stdin or editor paste, and all
+    our rules anchor with ^/$.
+    """
+    if not rules:
+        return None, None
+    stripped = prompt.strip()
+    for rid, rx, decision in rules:
+        if rx.search(stripped):
+            return decision, rid
+    return None, None
+
 
 # ---------------------------------------------------------------------------
 # Minimal YAML loader (stdlib-only).
@@ -1116,6 +1222,8 @@ def main() -> int:
     ap.add_argument("--planner-model", default=os.environ.get("ROUTER_PLANNER_MODEL", "qwen2.5:latest"))
     ap.add_argument("--planner-timeout", type=float, default=float(os.environ.get("ROUTER_PLANNER_TIMEOUT_SEC", "60")))
     ap.add_argument("--plan-log-file", default=os.environ.get("ROUTER_PLAN_LOG_FILE", str(SCRIPT_DIR / "plan.log")))
+    ap.add_argument("--fastpath-file", default=os.environ.get("ROUTER_FASTPATH_FILE", str(SCRIPT_DIR / "fastpath.yaml")))
+    ap.add_argument("--no-fastpath", action="store_true", help="disable regex intent fast-path for this invocation")
     args = ap.parse_args()
 
     models_path = Path(args.models_file)
@@ -1139,6 +1247,22 @@ def main() -> int:
         print(f"router: {len(buckets)} buckets, "
               f"{sum(len(b.get('ladder') or []) + len(b.get('fast_ladder') or []) for b in buckets)} ladder entries, "
               f"catalogue={len(catalogue)} ids")
+        # Also lint fastpath.yaml: every rule must have a valid regex and
+        # reference a real bucket. Unreachable rules (pattern already covered
+        # by a prior rule on a curated corpus) are a warning, not an error.
+        fp_path = Path(args.fastpath_file)
+        if fp_path.exists():
+            rules = load_fastpath(fp_path)
+            seen_ids: set[str] = set()
+            for rid, _, decision in rules:
+                if rid in seen_ids:
+                    problems.append(f"fastpath rule id {rid!r} is duplicated")
+                seen_ids.add(rid)
+                if decision["bucket"] not in valid_buckets:
+                    problems.append(f"fastpath rule {rid!r} references unknown bucket {decision['bucket']!r}")
+            print(f"router: {len(rules)} fastpath rule(s) loaded from {fp_path.name}")
+        else:
+            print(f"router: fastpath file not found ({fp_path}); fast-path disabled")
         if problems:
             for p in problems:
                 print(f"  ! {p}")
@@ -1221,6 +1345,23 @@ def main() -> int:
         reason = cached_cls.get("reason", "cache hit")
         cache_status = "hit"
 
+    # Fast-path: regex-based short-circuit for high-confidence prompts.
+    # Runs only on cache-miss; skipped entirely if the user passed
+    # --no-fastpath or set ROUTER_FASTPATH=0.
+    fastpath_rule: str | None = None
+    if picked_id is None and _fastpath_enabled() and not args.no_fastpath:
+        rules = load_fastpath(Path(args.fastpath_file))
+        fp_decision, fp_rule = try_fastpath(prompt, rules)
+        if fp_decision is not None and fp_decision["bucket"] in valid_buckets:
+            fp_picked, fp_note = resolve_id(
+                cfg, fp_decision["bucket"], fp_decision["latency"], fp_decision["effort"],
+            )
+            if fp_picked and (not catalogue or fp_picked in catalogue):
+                picked_id = fp_picked
+                parsed = fp_decision
+                fastpath_rule = fp_rule
+                reason = f"fastpath:{fp_rule} | {fp_note}"
+
     if picked_id is None:
         try:
             llm_prompt = build_prompt(cfg, prompt)
@@ -1271,6 +1412,7 @@ def main() -> int:
         "prompt_head": prompt[:160],
         "dur_ms": dur_ms,
         "cache": cache_status,
+        "fastpath": fastpath_rule,
     })
 
     # Fire-and-forget LLM-as-judge. Disabled by default; user opts in with
@@ -1286,8 +1428,13 @@ def main() -> int:
     )
 
     if args.explain or args.dry_run:
-        ch = " (cache hit)" if cache_status == "hit" else ""
-        print(f"router: picked {picked_id} — {reason}{ch} ({dur_ms}ms)", file=sys.stderr)
+        if cache_status == "hit":
+            tag = " (cache hit)"
+        elif fastpath_rule:
+            tag = " (fastpath)"
+        else:
+            tag = ""
+        print(f"router: picked {picked_id} — {reason}{tag} ({dur_ms}ms)", file=sys.stderr)
     if not args.dry_run:
         sys.stdout.write(picked_id)
     return 0

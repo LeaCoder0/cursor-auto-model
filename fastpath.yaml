@@ -1,0 +1,105 @@
+# fastpath.yaml — regex shortcuts that bypass the Ollama classifier.
+#
+# Each entry: a Python re.IGNORECASE pattern, and the (bucket, latency,
+# effort) triple to return on match. Checked top-to-bottom; first match wins.
+#
+# DESIGN RULES:
+# 1. Patterns must be UNAMBIGUOUS. If the same prompt could reasonably want a
+#    different bucket, DO NOT add it here — let the classifier handle it.
+# 2. Shortcuts are CONSERVATIVE. Always pick the cheapest defensible bucket.
+#    Undershooting (simple model handles a medium task) is recoverable;
+#    overshooting wastes money silently and never gets corrected.
+# 3. Keep the list SMALL (< 25 rules). A big list is a little classifier we
+#    wrote by hand badly. Don't reinvent the classifier here.
+# 4. Anchor patterns with ^/$ where possible so they only fire on the full
+#    prompt, not as substring matches.
+#
+# Env:
+#   ROUTER_FASTPATH=0   disable fastpath entirely
+#
+# On match, router.py logs {"fastpath": true, "pattern": "<id>"} to router.log
+# so we can audit how often each shortcut fires.
+
+rules:
+  # ---- trivial/chatty single-line asks ----
+  - id: greeting
+    pattern: '^(hi|hello|hey|yo|sup|gm|gn)[\s!.?]*$'
+    bucket: trivial_chat
+    latency: fast
+    effort: normal
+
+  - id: thanks
+    pattern: '^(thanks|thank you|ty|thx|cheers)[\s!.?]*$'
+    bucket: trivial_chat
+    latency: fast
+    effort: normal
+
+  # ---- short factual Q&A (no code) ----
+  - id: what_is_short
+    pattern: '^(what|who|when|where|why)\s+(is|are|was|were|does|do|did)\b.{0,80}\?\s*$'
+    bucket: quick_qa
+    latency: fast
+    effort: normal
+
+  - id: define_word
+    pattern: '^(define|explain briefly|what does)\s+[\w\s-]{1,40}\??\s*$'
+    bucket: quick_qa
+    latency: fast
+    effort: normal
+
+  # ---- single-file, single-line tweaks ----
+  - id: fix_typo
+    pattern: '^(fix|correct)\s+(a |the |this )?typo\b'
+    bucket: simple_code_edit
+    latency: fast
+    effort: normal
+
+  - id: rename_symbol
+    pattern: '^rename\s+[\w.`''"-]+\s+to\s+[\w.`''"-]+\s*\.?\s*$'
+    bucket: simple_code_edit
+    latency: fast
+    effort: normal
+
+  - id: add_docstring
+    pattern: '^add (a |the )?(doc(string)?|comment)\b.{0,80}$'
+    bucket: simple_code_edit
+    latency: fast
+    effort: normal
+
+  - id: remove_console_log
+    pattern: '^(remove|strip|delete)\s+(all\s+)?(console\.log|print|println|debug)\b'
+    bucket: simple_code_edit
+    latency: fast
+    effort: normal
+
+  - id: convert_var_const
+    pattern: '^(convert|change|replace)\s+(all\s+)?(var|let)\s+to\s+(const|let)\b'
+    bucket: simple_code_edit
+    latency: fast
+    effort: normal
+
+  - id: format_code
+    pattern: '^(format|prettify|reformat)\s+(this|the)?\s*(code|file|function)?\s*\.?\s*$'
+    bucket: simple_code_edit
+    latency: fast
+    effort: normal
+
+  # ---- short explanations of code (read-only) ----
+  - id: what_does_code_do
+    pattern: '^what (does|is) this (code|function|snippet) (do|doing)\??\s*$'
+    bucket: quick_qa
+    latency: fast
+    effort: normal
+
+  - id: explain_error_short
+    pattern: '^(why|what).{0,60}(error|exception|crash)\??\s*$'
+    bucket: quick_qa
+    latency: fast
+    effort: normal
+
+  # ---- list/show style asks ----
+  - id: list_files
+    pattern: '^(list|show|print)\s+(the\s+)?(files|directories|contents)\b'
+    bucket: agentic_tool_loop
+    latency: fast
+    effort: normal

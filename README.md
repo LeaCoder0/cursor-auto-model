@@ -10,6 +10,7 @@ planner.
 - **13 routing buckets, 93 Cursor model ids** — every listed model is reachable.
 - **Wave-parallel task execution** with file-write conflict detection.
 - **SHA-256 prompt cache** — cold classify 5–7 s, warm hit ~55 ms.
+- **Regex intent fast-path** — trivial prompts (greetings, typo fixes, `rename X to Y`, …) skip Ollama entirely (~70 ms).
 - **Optional LLM-as-judge** on a sample of runs for offline quality signal.
 - **Safe by default**: on any failure, falls back to a known-good model and exits 0.
 
@@ -61,8 +62,9 @@ On any parse / classify / Ollama failure at any stage, we fall back to a default
 
 | File | What it is |
 |---|---|
-| [`router.py`](./router.py) | Classifier + planner + resolver + cache + judge. Single file, stdlib only. |
+| [`router.py`](./router.py) | Classifier + planner + resolver + cache + judge + fast-path. Single file, stdlib only. |
 | [`models.yaml`](./models.yaml) | Bucket → ladder configuration. The only place model policy lives. |
+| [`fastpath.yaml`](./fastpath.yaml) | Regex intent shortcuts. Matches bypass the Ollama classifier. Edit freely; `router.py --validate` lints it. |
 | [`cursor-models.tsv`](./cursor-models.tsv) | Authoritative list of Cursor model ids (dumped from `cursor-agent --list-models`). |
 | [`cursor-auto-router`](./cursor-auto-router) | Bash wrapper: classify → `cursor-agent --model <picked>`. |
 | [`cursor-auto-plan`](./cursor-auto-plan) | Bash orchestrator: plan → wave-parallel execution. |
@@ -93,6 +95,13 @@ self-contained in its own directory.
 | `ROUTER_CATALOGUE_FILE` | `./cursor-models.tsv` | Override model catalogue |
 | `ROUTER_LOG_FILE` | `./router.log` | Classifier decision log (newline-JSON) |
 | `ROUTER_PLAN_LOG_FILE` | `./plan.log` | Planner decision log (newline-JSON) |
+
+### Fast-path (regex shortcuts)
+
+| Variable | Default | What it controls |
+|---|---|---|
+| `ROUTER_FASTPATH` | `1` | `0` disables the regex fast-path entirely |
+| `ROUTER_FASTPATH_FILE` | `./fastpath.yaml` | Override the fast-path rule file |
 
 ### Cache
 
