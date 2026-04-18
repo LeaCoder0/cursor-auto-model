@@ -7,6 +7,13 @@ server-side `auto`, building the TLS logger, discovering the Rust native
 addon), see [`DESIGN.md`](./DESIGN.md). This file is the forward-looking
 roadmap; DESIGN.md is the backward-looking engineering log.
 
+> **Scope guard.** This project is a **client-side router + orchestrator
+> for `cursor-agent`**. It is intentionally a zero-dependency Python + bash
+> tool. Several ideas we steal from bigger frameworks (`ruflo`,
+> `llm-router`, `Routerly`, etc.) have a scaled-down adaptation planned
+> here. Every planned item below is re-scored against: *can it be done in
+> stdlib Python + bash, without new runtime deps, without GPU?*
+
 ---
 
 ## 0. Where we started
@@ -14,16 +21,17 @@ roadmap; DESIGN.md is the backward-looking engineering log.
 **Original question:** *How does Cursor Agent CLI's `auto` mode actually pick
 a model, and can we predict or replicate it client-side?*
 
-This turned into a multi-stage investigation that changed the goal twice
-along the way:
+This turned into a multi-stage investigation that changed the goal three
+times along the way:
 
 | Phase | Goal | Outcome |
 |---|---|---|
-| 0 | Understand `auto` by reading the CLI | `auto` is server-side; CLI just asks `api2.cursor.sh` via `GetDefaultModelForCli`. |
+| 0 | Understand `auto` by reading the CLI | `auto` is server-side; the CLI just asks `api2.cursor.sh` via `GetDefaultModelForCli`. |
 | 1 | Log the wire format to observe `auto` | Built `logger.js` (Node `--require` preload, TLS hook, HTTP framing, decompression, redaction). Captured catalogue + telemetry, but **chat RPC was invisible** — it goes through a Rust native addon with its own network stack, bypassing Node.js. |
 | 2 | Since we can't observe it, **replace it** | Built `router.py`: a two-stage classifier (local Ollama → bucket → deterministic ladder → Cursor model id). One model per prompt. |
 | 3 | One model per prompt is a toy; upgrade to a planner | Added planner mode: decompose prompt → DAG of subtasks → wave-ordered execution with per-task model selection. `cursor-auto-plan` wraps this. |
-| 4 | Steal good ideas from existing OSS routers | Researched 5 projects (`agent-orchestrator`, `virtusoul-router`, `optimus-code`, `Routerly`, `llm-router`). Shipped Tier-1 ports: yolo-flag bundle, SHA-256 prompt cache, 4-tier JSON parser, long-prompt stdin delivery, LLM-as-judge. |
+| 4 | Steal good ideas from existing OSS routers | Researched 5 small projects (`agent-orchestrator`, `virtusoul-router`, `optimus-code`, `Routerly`, `llm-router`). Shipped Tier-1: yolo-flag bundle, SHA-256 prompt cache, 4-tier JSON parser, long-prompt stdin delivery, LLM-as-judge. |
+| 5 | Look at the biggest OSS agent-orchestration platform (`ruflo` / ex-claude-flow, 32k ★) | Identified 8 concepts that map onto our design without pulling in their Rust/WASM stack. Slotted into Tier-2 / Tier-3 / Tier-4 below. |
 
 ---
 
@@ -65,9 +73,9 @@ along the way:
 
 ### 1.2 Components
 
-| File | Role | Lines |
-|---|---|--:|
-| `router.py` | Classifier + planner + resolver + cache + judge (single file, stdlib-only). | ~1100 |
+| File | Role |
+|---|---|
+| `router.py` | Classifier + planner + resolver + cache + judge (single file, stdlib-only). |
 | `models.yaml` | Bucket definitions. 13 buckets, 145 ladder entries. The **only** place model policy lives — retiring/adding Cursor models is a YAML edit. |
 | `cursor-models.tsv` | Authoritative catalogue (93 ids) dumped from `cursor-agent --list-models`. Used for ladder validation. |
 | `cursor-auto-router` | Thin bash wrapper: classify prompt → `cursor-agent --model <picked>`. Single-prompt mode. |
@@ -87,8 +95,8 @@ along the way:
    (d) truncation repair (close unterminated strings, drop dangling keys, balance brackets).
 4. Classifier mode: `(bucket, latency, effort)` → walk `models.yaml` ladder → Cursor model id.
 5. Planner mode: validate task DAG, assign a model per task via the same resolver, run Kahn's topological sort into **waves**, auto-serialise any tasks within a wave whose `writes` overlap.
-6. **Cache-put** the decision so the next identical prompt is a 40 ms hit.
-7. With probability `ROUTER_JUDGE_SAMPLE`, fork a detached judge process that asks a cheap Ollama model whether the routing was `ok`/`over`/`under`/`wrong_bucket` and appends to `judge.log`. **Not** fed back into routing automatically.
+6. **Cache-put** the decision so the next identical prompt is a ~40 ms hit.
+7. With probability `ROUTER_JUDGE_SAMPLE`, fork a detached judge process that asks a cheap Ollama model whether the routing was `ok`/`over`/`under`/`wrong_bucket` and appends to `judge.log`. **Not** fed back into routing automatically (Tier-3 closes that loop).
 
 ### 1.4 Measured latency (local qwen2.5:latest)
 
@@ -111,122 +119,129 @@ along the way:
 
 ---
 
-## 2. Where we're going — roadmap
+## 2. Ideas harvested from `ruflo` (ruvnet/ruflo, 32k★)
 
-Ordered by value × (1 / cost). Tier 1 already shipped.
+ruflo is a much larger project than ours (100+ agent definitions, WASM
+kernels, Rust vector DB, Raft/BFT consensus, a 313-tool MCP server). Most of
+that is infeasible to port into a stdlib-only Python tool. But a handful of
+**concepts** map very cleanly onto what we already have. For each, we list
+what ruflo does and what we'd *actually* build.
+
+| # | ruflo concept | Our adaptation | Where it lands |
+|---|---|---|---|
+| A | **Agent Booster (WASM)** — skip LLM entirely for deterministic edits like `var→const`, `add-types`, `remove-console`. | An **intent-classifier fast-path** in `router.py` that matches ~10 high-confidence regex patterns and routes to `composer-2-fast` with `effort=normal` *without* a classifier call. Saves 5–7 s on the cheap case. | Tier 2 (T2.A) |
+| B | **Agent role registry** — one YAML per role (`coder.yaml`, `reviewer.yaml`, `architect.yaml`, `tester.yaml`, `security-architect.yaml`). | A sibling `agents/` directory with one YAML per "agent persona". Each task in a plan can reference a persona which contributes a system-prompt preamble passed to `cursor-agent --print`. Buckets keep deciding **model**; personas decide **voice**. | Tier 2 (T2.B) |
+| C | **`RETRIEVE → JUDGE → DISTILL → CONSOLIDATE → ROUTE` learning loop** (SONA / ReasoningBank). | Our local version: (1) RETRIEVE = cache + memory lookup, (2) JUDGE = we already ship this, (3) DISTILL = take N judge verdicts per bucket and summarise to a `notes.md` per bucket, (4) CONSOLIDATE = on ≥3 corrections, promote to override in `memory.json`, (5) ROUTE = classifier reads `memory.json` as a pre-filter. | Tier 2 (T2.C, merges old T2.1) |
+| D | **Hooks** — `pre-task`, `post-task`, `pre-wave`, `post-wave`, `on-failure` scripts that Claude Code runs automatically. | `cursor-auto-plan` scans `.cursor-auto-plan/hooks/<stage>/*.sh` and runs each executable for that stage. Default: none. Typical use: lint check after a wave, auto-revert on failure, post to Slack. | Tier 3 (T3.A) |
+| E | **Anti-drift checkpoints** — every few tasks, ask "are we still on-goal?" and reconcile. | Between waves, if `ROUTER_DRIFT_CHECK=1`, run one extra judge pass that reads the original prompt + the list of completed task descriptions, and returns `on_track` / `drift` / `stop`. Orchestrator halts on `stop`. | Tier 3 (T3.B) |
+| F | **Multi-provider failover** (Anthropic → OpenAI → Ollama). | We already do *intra-Cursor* ladder fallback. ruflo's insight: also fall back on *transient* errors (rate-limit, 5xx from Cursor). Wrap each `cursor-agent --model X` call in a 1-retry-with-next-ladder-entry shim in `cursor-auto-plan`. | Tier 3 (T3.C) |
+| G | **Token optimiser** — compress context via pattern cache. | Over time, `.cache/cls/*.json` becomes a corpus of `(prompt, bucket)` pairs. Export as a tiny `training/examples.jsonl` so any future local-ML classifier (existing Tier 3) has ground-truth to train on. No runtime change needed, just a collection habit. | Tier 3 (T3.D) |
+| H | **Queen / worker hive-mind with Raft/BFT consensus** (the headline ruflo feature). | **Explicitly declined.** We have one orchestrator and N single-shot subprocesses — nothing to reach consensus about, no Byzantine faults to tolerate. Documented as a non-goal. | Non-goal §3 |
+
+### 2.1 Why most of ruflo is out of scope
+
+| ruflo subsystem | Why we skip |
+|---|---|
+| SONA / EWC++ / Flash Attention / LoRA | Requires training a neural model. Our routing has ~13 classes over ~93 model ids; a decision tree or the concept **C** loop above solves 95% of what they solve. |
+| HNSW + ONNX MiniLM vector memory | A file-based key→value cache with SHA-256 keys already gives us ~40ms retrieval for exact matches; nearest-neighbour retrieval for *semantic* matches is a Tier-3 ML-classifier concern (already tracked as T3.1 before), not a separate HNSW store. |
+| 100+ specialized agents + SPARC methodology | Marketing. The concrete stealable part is the **YAML-per-role** format — that's T2.B. |
+| MCP server, plugin SDK, IPFS marketplace | Distribution concerns for a platform. We're a dot-sh + dot-py in a single repo. |
+| Rust / WASM kernels | Our hot path is a local Ollama call (seconds) or a cache hit (ms). Optimising Python or Rust-ifying anything gives ≤1% end-to-end. |
+
+---
+
+## 3. Roadmap
+
+Ordered by value × (1 / cost). Tier 1 has shipped. Each tier is a
+self-contained shipping window.
 
 ### Tier 1 — shipped ✅
 
-| # | Item | Status | Notes |
-|---|---|---|---|
-| T1.1 | Headless yolo-flag bundle (`--force --sandbox disabled --approve-mcps --trust`) | ✅ | `CAP_YOLO=1` default in `--exec`. |
-| T1.2 | SHA-256 prompt cache (classifier + planner) | ✅ | 1-week TTL; `ROUTER_CACHE_TTL_SEC=0` disables. |
-| T1.3 | 4-tier JSON parser | ✅ | Verified on 10 pathological inputs incl. truncation mid-string. |
-| T1.4 | Long-prompt stdin delivery (`printf %s \| --print`) | ✅ | Kicks in at 64 KB. |
-| T1.5 | Fire-and-forget LLM-as-judge | ✅ | `ROUTER_JUDGE_SAMPLE=0.1` to enable; writes `judge.log`. |
+| # | Item | Notes |
+|---|---|---|
+| T1.1 | Headless yolo-flag bundle (`--force --sandbox disabled --approve-mcps --trust`) | `CAP_YOLO=1` default in `--exec`. |
+| T1.2 | SHA-256 prompt cache (classifier + planner) | 1-week TTL; `ROUTER_CACHE_TTL_SEC=0` disables. |
+| T1.3 | 4-tier JSON parser | Verified on 10 pathological inputs incl. truncation mid-string. |
+| T1.4 | Long-prompt stdin delivery (`printf %s \| --print`) | Kicks in at 64 KB. |
+| T1.5 | Fire-and-forget LLM-as-judge | `ROUTER_JUDGE_SAMPLE=0.1` enables; writes `judge.log`. |
 
-### Tier 2 — next up 🎯
+### Tier 2 — next up 🎯 (3 themed batches)
 
-Bigger lifts, higher payoff. All three interact with each other, so we'll
-do them as one themed batch.
+All three batches interact. Ship them as one sprint.
 
-| # | Item | Cost | Why |
-|---|---|---|---|
-| T2.1 | **Learned routing memory** (port from llm-router's `memory/profiles.py`) | ~3 h | After N corrections (user manually picked model X for bucket Y three times in a row), auto-override for that bucket. Persisted in `memory.json`. |
-| T2.2 | **Multi-policy scoring** (port from Routerly) | ~4 h | Instead of `ladder[tier]` = one-shot pick, score each candidate against a pipeline of policies (`cheapest`, `fastest`, `last_known_healthy`, `capability`, `memory_override`) and return the top-k. Enables graceful degradation if a model is rate-limited. |
-| T2.3 | **Per-task git worktrees** (port from Optimus Code / agent-orchestrator) | ~4 h | When two waves-1 tasks touch the same file, auto-branch into worktrees and execute each task in isolation. Requires a merge-back step (probably: just land them serially on failure, parallel on success, and leave the worktree around for the user to inspect on conflict). |
+| # | Item | Est. cost | Why | Source |
+|---|---|---|---|---|
+| T2.A | **Intent-classifier fast-path**: before calling Ollama, match prompt against ~10 high-confidence regex patterns (`/^fix (the )?typo/i`, `/^rename .* to .*/i`, etc.) and short-circuit to `composer-2-fast`. Miss falls through to the classifier. | ~2 h | Saves 5–7 s on the common trivial case. Inspired by ruflo Agent Booster. | ruflo A |
+| T2.B | **Agent role registry** (`agents/*.yaml`): each YAML declares `name`, `system_prompt`, `preferred_bucket`, `effort`. Planner emits `role` per task; orchestrator prepends `[Role: <system_prompt>]` to the task description before `--print`. | ~3 h | Better prompts without touching the classifier. Ported verbatim-pattern from ruflo's `agents/`. | ruflo B |
+| T2.C | **Learned routing memory** (supersedes old T2.1). Implements the full 5-stage `RETRIEVE→JUDGE→DISTILL→CONSOLIDATE→ROUTE` loop: cache and judge already exist (R+J), add `router.py --distill` (daily cron / manual) that summarises `judge.log` into per-bucket `memory/*.md`, and `memory.json` overrides read at route-time. After ≥3 same-direction corrections for a bucket, auto-promote to a hard override. | ~5 h | Turns the judge from "interesting log I never read" into a closed loop. | ruflo C + llm-router/profiles.py |
+| T2.D | **Multi-policy scoring** (was T2.2). Replace `ladder[tier]` one-shot pick with a scored candidate list: `cheapest`, `fastest`, `last_known_healthy`, `capability`, `memory_override`. Top-1 is returned; top-3 is logged for future debugging. | ~4 h | Graceful degradation when a model is rate-limited or deprecated. | Routerly |
+| T2.E | **Per-task git worktrees** (was T2.3). When two tasks in the same wave have overlapping `writes`, spawn each in its own `git worktree` branch; leave them for the user to diff/merge on conflict. Non-conflicting tasks still run in the main tree. | ~4 h | Safe parallelism for file-writing agents. Defer the auto-merge; humans merge. | Optimus Code + agent-orchestrator |
 
-**Design constraints for Tier 2:**
+**Shared design constraints for all of Tier 2:**
 
-- No new runtime dependencies. Stdlib + `cursor-agent` + `ollama` only.
-  If a design needs `sentence-transformers`, we defer it to Tier 3.
-- Every new feature must have an **off-by-default** env var. Power users
-  opt in; new users get the current behaviour unchanged.
-- Every change must keep `router.py --validate` green.
+- No new runtime dependencies. Stdlib Python + `cursor-agent` + `ollama` only.
+- Every new feature has an **off-by-default** env var. Opt-in.
+- `python3 router.py --validate` stays green.
 
 ### Tier 3 — probably 🤔
 
-Bigger surface-area changes. Each is a weekend project.
+Bigger surface, each is a weekend project.
 
-| # | Item | Cost | Why |
+| # | Item | Est. cost | Source |
 |---|---|---|---|
-| T3.1 | **Local ML classifier** (port VirtuSoul's `MiniLM + LogisticRegression`) | ~1 day | Replace the Ollama classifier with a 15 ms embedder. Huge latency win but adds `sentence-transformers` dependency and a small pre-trained model artefact. Gate behind `ROUTER_CLASSIFIER=ml` env var; keep Ollama as default + fallback. |
-| T3.2 | **Judge → memory loop** | ~4 h | Today the judge writes `judge.log` and humans read it. Next step: when the judge says `over`/`under` with confidence > 0.8 for the same bucket three times, automatically promote/demote the default effort in `memory.json`. Requires T2.1. |
-| T3.3 | **MCP-based multi-agent orchestration** (idea from Optimus Code) | ~2 days | Give each sub-task agent an MCP channel back to the planner so it can report partial results / request re-planning. Currently each sub-task is a black-box `cursor-agent --print`. |
-| T3.4 | **Telemetry dashboard** | ~1 day | `router.log`, `plan.log`, `judge.log` are all newline-JSON. A tiny Flask / static HTML tool that renders hit-rate, avg latency, bucket-distribution, and judge-disagreement-rate over time. |
+| T3.A | **Stage hooks** (`pre-wave`/`post-wave`/`pre-task`/`post-task`/`on-failure`) executed from `.cursor-auto-plan/hooks/<stage>/*.sh`. Stdout passes environment like `CF_TASK_ID`, `CF_MODEL`, `CF_WAVE`. | ~4 h | ruflo D |
+| T3.B | **Anti-drift checkpoint** between waves (`ROUTER_DRIFT_CHECK=1`). Extra judge call that compares completed-subtask summaries against the original prompt and returns `on_track`/`drift`/`stop`. | ~3 h | ruflo E |
+| T3.C | **Transient-error retry** around `cursor-agent` in the orchestrator: on non-zero exit from a known retryable class (rate-limit, 5xx), retry once with the next ladder entry. | ~2 h | ruflo F |
+| T3.D | **Training-corpus export**: `router.py --export-training path.jsonl` dumps every cached `(prompt, parsed_bucket, picked_model)` tuple as a JSONL stream, ready to train a local ML classifier. | ~1 h | ruflo G |
+| T3.E | **Local ML classifier** (was T3.1). Replace Ollama in the classifier stage with `MiniLM + LogisticRegression` or similar. Opt-in via `ROUTER_CLASSIFIER=ml`; Ollama stays as default + fallback. Requires `sentence-transformers` dependency — added only under an `extras` install flag. Training data from T3.D. | ~1 day | VirtuSoul |
+| T3.F | **Judge → memory auto-loop** (was T3.2, now upgraded). When judge says `over`/`under` with confidence >0.8 for the same bucket ≥3 times, update `memory.json` defaults automatically. Requires T2.C. | ~4 h | Our extension |
+| T3.G | **Telemetry dashboard** (was T3.4). Tiny static HTML that renders newline-JSON logs: cache hit-rate, avg latency, bucket distribution, judge disagreement over time, drift-check outcomes. | ~1 day | — |
+| T3.H | **Cross-machine planner**. Formalise the already-supported remote-Ollama pattern with `scripts/remote-planner.sh`, an SSH-tunnel helper, and a health-check. | ~2 h | — |
 
-### Tier 4 — maybe ⏸
+### Tier 4 — maybe ⏸ (speculative, unscheduled)
 
-Speculative. Listed for completeness, not scheduled.
-
-- **Streaming plans.** Start executing wave 1 while the planner is still
-  emitting wave 2. Needs a streaming JSON parser and rework of the
-  orchestrator wave loop.
-- **Cross-machine planner.** The planner already honours `ROUTER_PLANNER_URL`,
-  so running a larger Ollama on a beefier box via SSH tunnel works today.
-  Formalise it with a `scripts/remote-planner.sh` and a health check.
-- **Policy learning from git diffs.** Post-execution, diff what the agent
-  wrote vs. what the user kept after review. Feed that signal into the
-  memory layer. Needs reliable git-diff-of-agent-commits detection.
-- **Give up on Cursor's HTTPS-in-Rust-addon.** If we ever need to observe
-  chat on the wire, the approach would be to `LD_PRELOAD` a shim around
-  `SSL_write`/`SSL_read`. Deferred indefinitely — we pivoted away from
-  passive observation for a reason.
+- **Streaming plans.** Execute wave 1 while planner still emits wave 2.
+- **Policy learning from git diffs.** Post-run, diff what the agent wrote vs. what the user kept after review. Feed into memory.
+- **Observer shim for Cursor chat RPC.** If we ever need on-wire chat observability, the move is `LD_PRELOAD` around `SSL_write`/`SSL_read` in `cursor-agent`'s Rust addon. Deferred indefinitely — we pivoted away from passive observation for a reason.
+- **MCP server wrapper.** Expose `cursor-auto-plan` as an MCP tool so it can be called from within `cursor-agent` sessions itself. Recursive but useful.
+- **Dual-mode (Cursor + Codex/Claude Code).** ruflo supports both. We pin to Cursor deliberately; revisit only if a user asks.
 
 ---
 
-## 3. Non-goals
+## 4. Non-goals
 
 Explicitly out of scope so we don't accidentally scope-creep:
 
-1. **Replacing `cursor-agent`.** This project always shells out to the
-   real CLI. We're a router + orchestrator, not an agent.
-2. **Supporting non-Cursor model providers.** The ladders in
-   `models.yaml` are Cursor model ids. A port to OpenAI / Anthropic
-   directly would need a different resolver and a different value
-   proposition — out of scope here.
-3. **Any GUI.** CLI + JSON logs. If someone wants a dashboard they can
-   render the newline-JSON themselves (T3.4 is a tiny static renderer,
-   not a product).
-4. **Formal correctness of the DAG.** Kahn's topo-sort gives a valid
-   execution order for any DAG we build. If the planner LLM produces
-   non-DAG output (cycle / dangling ref), we fall back to a 1-task plan.
-   We do **not** try to heal the DAG.
+1. **Replacing `cursor-agent`.** This project always shells out to the real CLI. We're a router + orchestrator, not an agent.
+2. **Supporting non-Cursor model providers.** The ladders in `models.yaml` are Cursor model ids. A port to OpenAI / Anthropic direct would need a different resolver and a different value proposition — out of scope.
+3. **Any GUI.** CLI + JSON logs. T3.G is a static renderer over those logs, not a product.
+4. **Formal DAG correctness.** Kahn's topo-sort gives a valid execution order for any DAG we build. If the planner LLM produces non-DAG output (cycle / dangling ref), we fall back to a 1-task plan. We do not try to heal the DAG.
+5. **Multi-agent consensus (Raft / Byzantine / Gossip).** ruflo's headline feature. We have one orchestrator and N single-shot subprocesses. Nothing to reach consensus about.
+6. **Self-training neural models (SONA / EWC++ / Flash Attention / LoRA).** Infrastructure mismatch: requires GPU, WASM runtime, or a training loop. The learning loop in T2.C achieves the same end goal (better routing over time) in ~200 lines of Python.
+7. **On-the-wire observability of Cursor's chat RPC.** Deferred indefinitely — the Rust addon bypasses Node.js and `LD_PRELOAD` is the only route.
 
 ---
 
-## 4. Open questions
+## 5. Open questions
 
 Things we've deliberately left undecided:
 
-- **Cache invalidation when `models.yaml` changes.** Currently the cache key
-  includes a hash of bucket names, so renaming a bucket invalidates all
-  cached decisions for that bucket. But changing a bucket's `ladder`
-  without renaming the bucket does **not** invalidate. Acceptable today
-  because ladders change rarely; revisit if we start editing ladders more
-  frequently than weekly.
-- **Fairness across waves.** Today wave N+1 waits for *all* of wave N. A
-  stuck task in wave N blocks independent downstream work. Could be
-  fixed by running the topo-sort at task granularity instead of wave
-  granularity, but then logs become much harder to read. Not urgent.
-- **Judge model choice.** Right now the same `qwen2.5:latest` judges its
-  own classifier output. That's suspicious. Using a different small
-  model (e.g. `llama3.2:3b`) as the judge would be more honest.
-  Parameterised via `ROUTER_JUDGE_MODEL`, so a flip is one env var away.
+- **Cache invalidation when `models.yaml` changes.** Cache key includes a hash of bucket *names*, so renaming invalidates. Changing a `ladder` entry under the same bucket name does **not** invalidate. Acceptable today; revisit if ladder churn picks up.
+- **Fairness across waves.** Wave N+1 waits for *all* of wave N. A stuck task in wave N blocks independent downstream work. Could run topo-sort at task granularity instead of wave granularity, but logs become much harder to read. Not urgent.
+- **Judge model choice.** Same `qwen2.5:latest` judging its own classifier output is suspicious. A different small model (e.g. `llama3.2:3b`) would be more honest. One env var flip — `ROUTER_JUDGE_MODEL` — once T2.C lands and we actually start reading the judge log.
+- **Should the intent-classifier fast-path (T2.A) pass through user intent to the task description?** E.g. match `^fix the typo in (.+)$`, bind `$1` as a parameter, and prepend "Fix the typo in `$1` and nothing else." to the cursor-agent `--print` arg. Probably yes, but first design the regex→template mapping carefully.
+- **Role registry (T2.B) — should `role` also override `bucket`?** Currently designed so `role` only adds a system-prompt preamble; `bucket` is still chosen by the classifier. An alternative: `role=security-architect` forces `bucket=coding_hard` regardless. Leaning toward "preamble-only" to keep the mental model simple.
 
 ---
 
-## 5. Contribution flow
+## 6. Contribution flow
 
 For future-us or anyone reading this:
 
-1. **Edit `models.yaml`**, then `python3 router.py --validate`. That's the
-   lowest-risk change and covers ~80% of the surface area.
+1. **Edit `models.yaml`**, then `python3 router.py --validate`. Lowest-risk change, ~80% of the surface area.
 2. **Router/planner logic** lives in `router.py`. Keep it stdlib-only.
 3. **Orchestrator** lives in `cursor-auto-plan`. Keep bash POSIX-ish.
-4. **Never commit `cursor-auto.log`, `router.log`, `plan.log`,
-   `judge.log`, `.cache/`, `.cursor-auto-plan/`.** `.gitignore` already
-   excludes them; don't `-f` them in.
+4. **Never commit** `cursor-auto.log`, `router.log`, `plan.log`, `judge.log`, `.cache/`, `.cursor-auto-plan/`. `.gitignore` excludes them; don't `-f` them in.
 5. **Smoke test before pushing:**
    ```bash
    python3 router.py --validate
@@ -234,5 +249,20 @@ For future-us or anyone reading this:
    python3 router.py --plan --prompt "add dark mode"
    ./cursor-auto-plan --exec --dry-run -p "add dark mode"
    ```
+
+---
+
+## 7. TL;DR for the next sprint
+
+**Tier 2, in order:**
+
+1. **T2.A** Intent-classifier fast-path — 10 regex shortcuts → skip Ollama. *2 h, 5–7 s saved per hit.*
+2. **T2.B** Agent role registry — `agents/*.yaml` + system-prompt prepending. *3 h.*
+3. **T2.C** Learned routing memory — close the `judge.log → memory.json → router` loop. *5 h.*
+4. **T2.D** Multi-policy scoring — replace one-shot ladder pick with a scored candidate list. *4 h.*
+5. **T2.E** Per-task git worktrees — safe parallel writes. *4 h.*
+
+Total ~18 hours of work. Everything is opt-in, everything preserves the
+existing fallback guarantees, nothing adds a runtime dependency.
 
 That's the plan.
