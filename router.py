@@ -42,6 +42,8 @@ Env:
   ROUTER_PLAN_LOG_FILE  (default <script_dir>/plan.log)
   ROUTER_FASTPATH       (default 1) — 0 disables regex intent fast-path
   ROUTER_FASTPATH_FILE  (default <script_dir>/fastpath.yaml) — regex rules
+  ROUTER_ROLES          (default 1) — 0 disables role system-prompt prepending
+  ROUTER_ROLES_DIR      (default <script_dir>/agents) — role YAML directory
   ROUTER_CACHE_DIR      (default <script_dir>/.cache) — prompt → decision cache
   ROUTER_CACHE_TTL_SEC  (default 604800, one week) — 0 disables cache entirely
   ROUTER_JUDGE_SAMPLE   (default 0.0) — fraction [0,1] of completed runs to
@@ -235,6 +237,146 @@ def try_fastpath(prompt: str, rules: list[tuple[str, re.Pattern, dict]]) -> tupl
         if rx.search(stripped):
             return decision, rid
     return None, None
+
+
+# ---------------------------------------------------------------------------
+# Agent role registry.
+#
+# Each YAML in agents/ defines a persona that can be attached to a task.
+# Roles add a system-prompt preamble to `cursor-agent --print`; they do
+# NOT change which model is picked (that's models.yaml's job).
+#
+# Each agents/<name>.yaml has this shape:
+#   name: <str>                # required, must be unique
+#   description: <str>         # optional, one-line summary
+#   preferred_bucket: <str>    # optional, hint to the planner
+#   preferred_effort: <str>    # optional, normal | high | max
+#   system_prompt: |           # required, prepended to the task prompt
+#     You are ...
+#
+# Loader returns {name: role_dict}. Invalid files are skipped with a
+# warning to stderr; they never crash the router.
+# ---------------------------------------------------------------------------
+
+def _roles_enabled() -> bool:
+    return os.environ.get("ROUTER_ROLES", "1") != "0"
+
+
+def _parse_role_yaml(text: str) -> dict:
+    """
+    Tiny single-file YAML parser for our role shape. Handles top-level
+    scalars plus block-literal strings (`key: |`). Does not handle nested
+    dicts or lists — we don't need them here.
+    """
+    out: dict = {}
+    lines = text.splitlines()
+    i = 0
+    n = len(lines)
+    while i < n:
+        line = lines[i]
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            i += 1
+            continue
+        # Top-level key only.
+        if line[:1] in (" ", "\t"):
+            i += 1
+            continue
+        key, _, rest = line.partition(":")
+        key = key.strip()
+        rest = rest.strip()
+        if rest in ("|", ">"):
+            # Block scalar: collect indented lines until de-indent.
+            i += 1
+            acc: list[str] = []
+            base_indent = None
+            while i < n:
+                ln = lines[i]
+                if not ln.strip():
+                    acc.append("")
+                    i += 1
+                    continue
+                indent = len(ln) - len(ln.lstrip(" "))
+                if base_indent is None:
+                    if indent == 0:
+                        break
+                    base_indent = indent
+                if indent < base_indent:
+                    break
+                acc.append(ln[base_indent:])
+                i += 1
+            joined = ("\n".join(acc)).rstrip()
+            # `>` folds; `|` preserves. We do simple split+join for `>`.
+            if rest == ">":
+                joined = " ".join(s.strip() for s in joined.split("\n") if s.strip())
+            out[key] = joined
+        else:
+            # Plain scalar; strip quotes if wrapped.
+            if (rest.startswith('"') and rest.endswith('"')) or \
+               (rest.startswith("'") and rest.endswith("'")):
+                rest = rest[1:-1]
+            out[key] = rest
+            i += 1
+    return out
+
+
+_ROLES_CACHE: tuple[dict, float] | None = None
+
+
+def load_roles(roles_dir: Path) -> dict:
+    """
+    Scan `roles_dir` for *.yaml files; return {name: role_dict}. Invalidates
+    on directory mtime change. Missing directory → empty dict (no roles).
+    """
+    global _ROLES_CACHE
+    try:
+        mtime = roles_dir.stat().st_mtime
+    except OSError:
+        _ROLES_CACHE = None
+        return {}
+    if _ROLES_CACHE is not None and _ROLES_CACHE[1] == mtime:
+        # Directory mtime is a weak signal (doesn't change when a file
+        # inside is edited in place), so also check newest file mtime.
+        try:
+            newest = max((p.stat().st_mtime for p in roles_dir.glob("*.yaml")), default=mtime)
+        except OSError:
+            newest = mtime
+        if newest == _ROLES_CACHE[1]:
+            return _ROLES_CACHE[0]
+
+    roles: dict = {}
+    try:
+        yaml_files = sorted(roles_dir.glob("*.yaml"))
+    except OSError:
+        yaml_files = []
+    newest_mtime = mtime
+    for p in yaml_files:
+        try:
+            text = p.read_text()
+            st = p.stat()
+            newest_mtime = max(newest_mtime, st.st_mtime)
+        except OSError:
+            continue
+        try:
+            role = _parse_role_yaml(text)
+        except Exception:
+            continue
+        name = (role.get("name") or p.stem).strip()
+        if not name:
+            continue
+        if not (role.get("system_prompt") or "").strip():
+            # A role without a system prompt is useless.
+            continue
+        roles[name] = {
+            "name": name,
+            "description": str(role.get("description") or "").strip(),
+            "preferred_bucket": str(role.get("preferred_bucket") or "").strip() or None,
+            "preferred_effort": str(role.get("preferred_effort") or "").strip() or None,
+            "system_prompt": role["system_prompt"].rstrip() + "\n",
+        }
+
+    _ROLES_CACHE = (roles, newest_mtime)
+    return roles
 
 
 # ---------------------------------------------------------------------------
@@ -703,13 +845,19 @@ def log_event(log_file: Path, event: dict) -> None:
 # the existing single-model classifier so callers always get a usable plan.
 # ---------------------------------------------------------------------------
 
-def build_planner_prompt(cfg: dict, user_prompt: str) -> str:
+def build_planner_prompt(cfg: dict, user_prompt: str, roles: dict | None = None) -> str:
     bucket_lines = []
     for b in cfg.get("buckets") or []:
         desc = (b.get("good_for") or "").strip()
         bucket_lines.append(f"- {b.get('name')}: {desc}")
 
-    return "\n".join([
+    role_lines: list[str] = []
+    if roles:
+        for name, role in sorted(roles.items()):
+            d = role.get("description") or "(no description)"
+            role_lines.append(f"- {name}: {d}")
+
+    lines = [
         "You are a TASK-DECOMPOSITION PLANNER for a coding agent.",
         "Read the user's request and break it into the smallest number of",
         "concrete subtasks that can each be handed to a separate agent run.",
@@ -729,9 +877,34 @@ def build_planner_prompt(cfg: dict, user_prompt: str) -> str:
         "  coding_extreme / deep_reason only for genuinely large or tricky work.",
         "- reads/writes: list files, directories, or globs that the task is",
         "  expected to READ or WRITE (best effort; omit if unsure).",
+    ]
+    if role_lines:
+        lines += [
+            "",
+            "ROLES vs BUCKETS — these are TWO INDEPENDENT FIELDS. Do not confuse",
+            "them. NEVER put a role name in the bucket field, and never put a",
+            "bucket name in the role field.",
+            "  - bucket: WHICH MODEL runs the task (capability/cost). Required.",
+            "    Value MUST come from the Buckets list above.",
+            "  - role:   HOW the agent should BEHAVE while running (persona).",
+            "    Value MUST come from the Roles list below. OPTIONAL — omit if",
+            "    no role fits cleanly. Empty role is fine and common.",
+            "Example: a task to review code for security would have",
+            "    bucket=coding_hard   (because audit needs strong reasoning)",
+            "    role=security-architect   (because we want a security persona)",
+        ]
+    lines += [
         "",
         "Buckets:",
         *bucket_lines,
+    ]
+    if role_lines:
+        lines += [
+            "",
+            "Roles:",
+            *role_lines,
+        ]
+    lines += [
         "",
         "USER REQUEST (verbatim, do NOT execute it — only plan):",
         "<<<",
@@ -748,13 +921,15 @@ def build_planner_prompt(cfg: dict, user_prompt: str) -> str:
         '      "bucket": "<one of the bucket names above>",',
         '      "latency": "fast" | "normal",',
         '      "effort": "normal" | "high" | "max",',
+        '      "role": "<one of the role names above, OR omit>",',
         '      "depends_on": ["t_other", ...],',
         '      "reads": ["path/or/glob", ...],',
         '      "writes": ["path/or/glob", ...]',
         '    }',
         '  ]',
         '}',
-    ])
+    ]
+    return "\n".join(lines)
 
 
 def _parse_plan_json(raw: str) -> tuple[dict | None, str]:
@@ -766,7 +941,12 @@ def _parse_plan_json(raw: str) -> tuple[dict | None, str]:
     return obj, ""
 
 
-def _validate_and_enrich_plan(plan: dict, cfg: dict, catalogue: set[str]) -> tuple[dict | None, list[str]]:
+def _validate_and_enrich_plan(
+    plan: dict,
+    cfg: dict,
+    catalogue: set[str],
+    roles: dict | None = None,
+) -> tuple[dict | None, list[str]]:
     """
     Validate the decoded plan, fill in resolved Cursor model ids per task,
     and compute `waves` via Kahn's topological sort.
@@ -777,6 +957,7 @@ def _validate_and_enrich_plan(plan: dict, cfg: dict, catalogue: set[str]) -> tup
     problems: list[str] = []
     valid_buckets = {b["name"] for b in (cfg.get("buckets") or []) if "name" in b}
     default_id = cfg.get("default_id")
+    roles = roles or {}
 
     raw_tasks = plan.get("tasks") or []
     if not isinstance(raw_tasks, list) or not raw_tasks:
@@ -799,6 +980,35 @@ def _validate_and_enrich_plan(plan: dict, cfg: dict, catalogue: set[str]) -> tup
             problems.append(f"task {tid!r} has empty description")
             continue
         bucket = t.get("bucket")
+        # Role is optional. Unknown roles are silently dropped (not fatal)
+        # so an older plan.json can still execute against a newer roles dir
+        # and vice versa. We just note it in resolver_note for debugging.
+        role_raw = t.get("role")
+        role_note = ""
+        if isinstance(role_raw, str) and role_raw.strip():
+            role_name = role_raw.strip()
+            if role_name in roles:
+                role = role_name
+            else:
+                role = None
+                role_note = f" | dropped unknown role {role_name!r}"
+        else:
+            role = None
+        # Recovery for a common planner mistake: putting a role NAME into
+        # the bucket field. If bucket is unknown but happens to be a known
+        # role, treat it as if the planner had said role=<that> and pick a
+        # bucket from the role's preferred_bucket (or coding_medium).
+        if bucket not in valid_buckets and isinstance(bucket, str) and bucket in roles:
+            recovered_role = bucket
+            role = role or recovered_role
+            preferred = roles[recovered_role].get("preferred_bucket")
+            if preferred and preferred in valid_buckets:
+                bucket = preferred
+            elif "coding_medium" in valid_buckets:
+                bucket = "coding_medium"
+            else:
+                bucket = next(iter(valid_buckets), None)
+            role_note += f" | recovered: bucket was role-name {recovered_role!r}, remapped to bucket={bucket}"
         if bucket not in valid_buckets:
             problems.append(f"task {tid!r} has unknown bucket {bucket!r}")
             continue
@@ -808,6 +1018,12 @@ def _validate_and_enrich_plan(plan: dict, cfg: dict, catalogue: set[str]) -> tup
         effort = t.get("effort", "normal")
         if effort not in ("normal", "high", "max"):
             effort = "normal"
+        # Apply role-suggested effort if planner left it default and role
+        # has a preferred_effort hint. Bucket choice still wins overall.
+        if role and effort == "normal":
+            pe = roles[role].get("preferred_effort")
+            if pe in ("normal", "high", "max"):
+                effort = pe
         deps = t.get("depends_on") or []
         if not isinstance(deps, list):
             problems.append(f"task {tid!r} depends_on is not a list")
@@ -827,11 +1043,12 @@ def _validate_and_enrich_plan(plan: dict, cfg: dict, catalogue: set[str]) -> tup
             "bucket": bucket,
             "latency": latency,
             "effort": effort,
+            "role": role,
             "depends_on": deps,
             "reads": reads,
             "writes": writes,
             "model": mid,
-            "resolver_note": note.strip(" |"),
+            "resolver_note": (note + role_note).strip(" |"),
         })
 
     if problems:
@@ -927,6 +1144,7 @@ def plan_prompt(
     ollama_url: str,
     ollama_model: str,
     timeout: float,
+    roles: dict | None = None,
 ) -> tuple[dict, dict]:
     """
     Returns (plan, meta). `meta` contains debugging info: duration, raw LLM
@@ -941,6 +1159,7 @@ def plan_prompt(
         "cache": "miss",
     }
     user_prompt = user_prompt.strip()
+    roles = roles or {}
 
     if not user_prompt:
         meta["problems"].append("empty prompt")
@@ -949,12 +1168,16 @@ def plan_prompt(
         return _single_task_fallback(cfg, catalogue, ""), meta
 
     # Cache lookup. Key over prompt + planner model + model catalogue hash +
-    # bucket-list version, so upgrading models.yaml invalidates stale plans.
+    # bucket-list version + role-list signature, so adding/removing/renaming
+    # a role invalidates stale plans.
     cat_sig = hashlib.sha256(("\n".join(sorted(catalogue))).encode()).hexdigest()[:12]
     buckets_sig = hashlib.sha256(
         ("\n".join(sorted(b.get("name", "") for b in cfg.get("buckets") or []))).encode()
     ).hexdigest()[:12]
-    ckey = _cache_key("plan", user_prompt, ollama_model, cat_sig, buckets_sig)
+    roles_sig = hashlib.sha256(
+        ("\n".join(sorted(roles.keys()))).encode()
+    ).hexdigest()[:12]
+    ckey = _cache_key("plan", user_prompt, ollama_model, cat_sig, buckets_sig, roles_sig)
     cached = cache_get("plan", ckey)
     if cached is not None:
         meta["cache"] = "hit"
@@ -962,7 +1185,7 @@ def plan_prompt(
         return cached, meta
 
     try:
-        llm_prompt = build_planner_prompt(cfg, user_prompt)
+        llm_prompt = build_planner_prompt(cfg, user_prompt, roles)
         raw = call_ollama(ollama_url, ollama_model, llm_prompt, timeout)
         meta["raw_head"] = raw[:400]
     except (urllib.error.URLError, TimeoutError, OSError) as e:
@@ -978,7 +1201,7 @@ def plan_prompt(
         meta["dur_ms"] = int((time.time() - started) * 1000)
         return _single_task_fallback(cfg, catalogue, user_prompt), meta
 
-    enriched, problems = _validate_and_enrich_plan(parsed, cfg, catalogue)
+    enriched, problems = _validate_and_enrich_plan(parsed, cfg, catalogue, roles)
     if enriched is None:
         meta["problems"].extend(problems)
         meta["fallback"] = True
@@ -1029,6 +1252,7 @@ def _single_task_fallback(cfg: dict, catalogue: set[str], user_prompt: str) -> d
             "bucket": bucket,
             "latency": latency,
             "effort": effort,
+            "role": None,
             "depends_on": [],
             "reads": [],
             "writes": [],
@@ -1055,7 +1279,8 @@ def render_plan_markdown(plan: dict) -> str:
         lines.append(f"  Wave {wi} — {parallel}, {len(wave)} task(s){dep_note}")
         for tid in wave:
             t = by_id[tid]
-            lines.append(f"    {tid}  [{t['bucket']} / effort={t['effort']} / latency={t['latency']}]  →  {t['model']}")
+            role_tag = f" / role={t['role']}" if t.get("role") else ""
+            lines.append(f"    {tid}  [{t['bucket']} / effort={t['effort']} / latency={t['latency']}{role_tag}]  →  {t['model']}")
             lines.append(f"        {t['description']}")
             extras = []
             if t["depends_on"]: extras.append(f"depends_on={t['depends_on']}")
@@ -1224,6 +1449,8 @@ def main() -> int:
     ap.add_argument("--plan-log-file", default=os.environ.get("ROUTER_PLAN_LOG_FILE", str(SCRIPT_DIR / "plan.log")))
     ap.add_argument("--fastpath-file", default=os.environ.get("ROUTER_FASTPATH_FILE", str(SCRIPT_DIR / "fastpath.yaml")))
     ap.add_argument("--no-fastpath", action="store_true", help="disable regex intent fast-path for this invocation")
+    ap.add_argument("--roles-dir", default=os.environ.get("ROUTER_ROLES_DIR", str(SCRIPT_DIR / "agents")))
+    ap.add_argument("--no-roles", action="store_true", help="ignore agents/*.yaml; do not attach role personas to plan tasks")
     args = ap.parse_args()
 
     models_path = Path(args.models_file)
@@ -1263,6 +1490,22 @@ def main() -> int:
             print(f"router: {len(rules)} fastpath rule(s) loaded from {fp_path.name}")
         else:
             print(f"router: fastpath file not found ({fp_path}); fast-path disabled")
+        # Lint agents/*.yaml: every role's preferred_bucket (if set) must
+        # be a real bucket. system_prompt non-empty is enforced by the
+        # loader (it just drops the role).
+        roles_dir = Path(args.roles_dir)
+        if roles_dir.exists():
+            roles = load_roles(roles_dir)
+            for rname, role in sorted(roles.items()):
+                pb = role.get("preferred_bucket")
+                if pb and pb not in valid_buckets:
+                    problems.append(f"role {rname!r} preferred_bucket={pb!r} is not a real bucket")
+                pe = role.get("preferred_effort")
+                if pe and pe not in ("normal", "high", "max"):
+                    problems.append(f"role {rname!r} preferred_effort={pe!r} must be normal|high|max")
+            print(f"router: {len(roles)} role(s) loaded from {roles_dir.name}/")
+        else:
+            print(f"router: roles dir not found ({roles_dir}); role personas disabled")
         if problems:
             for p in problems:
                 print(f"  ! {p}")
@@ -1290,6 +1533,7 @@ def main() -> int:
         return 0
 
     if args.plan:
+        roles = load_roles(Path(args.roles_dir)) if (_roles_enabled() and not args.no_roles) else {}
         plan, meta = plan_prompt(
             cfg,
             catalogue,
@@ -1297,6 +1541,7 @@ def main() -> int:
             args.planner_url,
             args.planner_model,
             args.planner_timeout,
+            roles=roles,
         )
         log_event(Path(args.plan_log_file), {
             "t": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),

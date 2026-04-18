@@ -119,22 +119,41 @@ mkdir -p "$LOG_DIR"
 printf '%s\n' "$PLAN_JSON" > "$LOG_DIR/plan.json"
 
 # Build task map + waves via python (easier JSON handling than bash).
+# When a task has a role, we prepend that role's system_prompt to the task
+# description here — so the bash side stays simple. Roles can be disabled
+# globally via ROUTER_ROLES=0 (handled inside router.load_roles()).
 TASK_SCRIPT="$(mktemp)"
 cat > "$TASK_SCRIPT" <<'PY'
 import json, os, sys
+from pathlib import Path
+sys.path.insert(0, os.environ["SCRIPT_DIR"])
+import router
+
 plan = json.load(open(sys.argv[1]))
-# Emit: one line per task as "WAVE|ID|MODEL|DESCRIPTION".
+roles = router.load_roles(Path(os.environ.get("ROUTER_ROLES_DIR",
+                                              os.path.join(os.environ["SCRIPT_DIR"], "agents")))) \
+        if router._roles_enabled() else {}
+
+# Emit: one line per task as "WAVE|ID|MODEL|DESCRIPTION", where DESCRIPTION
+# already includes any role system-prompt preamble.
 by_id = {t["id"]: t for t in plan["tasks"]}
 for wi, wave in enumerate(plan["waves"], start=1):
     for tid in wave:
         t = by_id[tid]
-        desc = t["description"].replace("\n", " ").replace("|", "¦")
+        desc = t["description"]
+        rname = t.get("role")
+        if rname and rname in roles:
+            preamble = roles[rname]["system_prompt"].rstrip()
+            desc = f"{preamble}\n\n---\n\nTASK:\n{desc}"
+        # Pipe character is our delimiter; substitute and undo line breaks.
+        desc = desc.replace("\n", "\\n").replace("|", "¦")
         sys.stdout.write(f"{wi}|{tid}|{t['model']}|{desc}\n")
 # Summary to stderr
-sys.stderr.write(f"{len(plan['tasks'])} tasks / {len(plan['waves'])} waves\n")
+n_with_role = sum(1 for t in plan["tasks"] if t.get("role"))
+sys.stderr.write(f"{len(plan['tasks'])} tasks ({n_with_role} with role) / {len(plan['waves'])} waves\n")
 PY
 
-mapfile -t TASK_LINES < <(python3 "$TASK_SCRIPT" "$LOG_DIR/plan.json")
+mapfile -t TASK_LINES < <(SCRIPT_DIR="$SCRIPT_DIR" python3 "$TASK_SCRIPT" "$LOG_DIR/plan.json")
 rm -f "$TASK_SCRIPT"
 
 if [ "${#TASK_LINES[@]}" -eq 0 ]; then
@@ -232,6 +251,9 @@ for line in "${TASK_LINES[@]}"; do
   rest="${rest#*|}"
   model="${rest%%|*}"
   desc="${rest#*|}"
+
+  # Decode the inline-newline escape we used to keep mapfile happy.
+  desc="${desc//\\n/$'\n'}"
 
   if [ "$wi" != "$CURRENT_WAVE" ]; then
     # Drain current wave before starting a new one.
