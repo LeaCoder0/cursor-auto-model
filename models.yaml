@@ -1,0 +1,133 @@
+# Routing taxonomy for cursor-agent.
+#
+# The router does two things:
+#   1. Asks the local LLM to classify the prompt into ONE `bucket` below.
+#      It may also (optionally) set `latency` (fast|normal) and `effort`
+#      (normal|max). Those two fields only act as modifiers — an effort=max
+#      answer escalates inside the bucket to a stronger tier (-xhigh / -max),
+#      and latency=fast prefers `-fast` variants when they exist.
+#
+#   2. Resolves (bucket, latency, effort) → a single concrete Cursor model id,
+#      deterministically, using the ladders below. The ladder is ordered from
+#      normal → max; fast variants are listed in `fast_ladder` where available.
+#
+# Every id used below is a real id from `cursor-agent --list-models` (93 ids,
+# 22 families). See cursor-models.tsv for the full source list.
+#
+# To change policy: tweak the ladders. To change *which bucket* gets chosen
+# for your prompts: tweak the `good_for` text (that's what the router LLM reads).
+
+# Fallback if Ollama is down / picks something invalid / returns garbage.
+default_id: composer-2-fast
+
+# Fallback bucket if the LLM returns an unknown bucket name.
+default_bucket: simple_code_edit
+
+buckets:
+
+  - name: trivial_chat
+    good_for: >
+      Greetings, 1-sentence answers, yes/no, jokes, very short factual
+      lookups, anything where the reply should be under ~2 sentences.
+    ladder:      [composer-2-fast, gpt-5.4-nano-none, gpt-5.4-nano-low, gpt-5.4-nano-medium, gpt-5.4-nano-high, gpt-5.4-nano-xhigh, gpt-5.4-mini-none, gpt-5.4-mini-low]
+    fast_ladder: [composer-2-fast, gpt-5.4-nano-none, gpt-5.4-nano-low]
+
+  - name: quick_qa
+    good_for: >
+      Short explanations, definitions, one-paragraph answers, simple
+      factual questions, quick "how do I" lookups, no code.
+    ladder:      [gpt-5.4-mini-low, gpt-5.4-mini-medium, gpt-5.4-mini-high, gpt-5.4-mini-xhigh, gpt-5-mini, composer-1.5]
+    fast_ladder: [gpt-5.4-mini-low, gpt-5.4-mini-medium]
+
+  - name: light_write
+    good_for: >
+      Non-code short writing: emails, commit messages, changelog entries,
+      release notes, casual summaries, documentation tweaks, rephrasing.
+    ladder:      [composer-2, gpt-5.4-mini-medium, gpt-5.4-low, gpt-5.4-medium, gpt-5.4-high]
+    fast_ladder: [gpt-5.4-medium-fast, gpt-5.4-high-fast]
+
+  - name: simple_code_edit
+    good_for: >
+      Small code edits: typo/formatting fixes, renaming, boilerplate,
+      trivial scaffolds, one-line changes, adding a print/log statement,
+      well-defined tiny bug fixes with obvious cause.
+    ladder:      [composer-2-fast, composer-2, gpt-5.3-codex-low, gpt-5.3-codex, gpt-5.2-codex-low, gpt-5.1-codex-mini-low, gpt-5.1-codex-mini]
+    fast_ladder: [composer-2-fast, gpt-5.3-codex-low-fast, gpt-5.3-codex-fast, gpt-5.2-codex-low-fast, gpt-5.2-codex-fast]
+
+  - name: coding_medium
+    good_for: >
+      SINGLE-file feature work, standard bug fix with a clear repro,
+      implementing ONE function from a spec, adding a small test file,
+      straightforward API glue code. If the task spans many files or is
+      a big refactor, pick coding_hard instead.
+    ladder:      [gpt-5.3-codex, gpt-5.1-codex-mini, gpt-5.2-low, gpt-5.1-codex-mini-high, gpt-5.2-codex, gpt-5.2, gpt-5.2-high, claude-4-sonnet, claude-4.5-sonnet, gpt-5.3-codex-high, gpt-5.2-codex-high, gpt-5.1-codex-max-low, gpt-5.1-codex-max-medium]
+    fast_ladder: [gpt-5.3-codex-fast, gpt-5.2-low-fast, gpt-5.2-fast, gpt-5.2-high-fast, gpt-5.2-codex-fast, gpt-5.2-codex-high-fast, gpt-5.3-codex-high-fast, gpt-5.1-codex-max-low-fast, gpt-5.1-codex-max-medium-fast]
+
+  - name: coding_hard
+    good_for: >
+      Non-trivial coding across MULTIPLE files or a whole module:
+      refactors (async conversion, API changes, framework upgrades),
+      non-obvious bug hunts, algorithms and data-structure design,
+      writing a test suite across a module, migration scripts. Anything
+      described as "refactor", "multi-file", "across the codebase", or
+      "add comprehensive tests" belongs here, not in coding_medium.
+    ladder:      [gpt-5.3-codex-high, gpt-5.3-codex-xhigh, gpt-5.2-codex-high, gpt-5.2-codex-xhigh, gpt-5.1-codex-max-high, gpt-5.2-xhigh, claude-4.5-sonnet-thinking, claude-4-sonnet-thinking, claude-4-sonnet-1m-thinking]
+    fast_ladder: [gpt-5.3-codex-high-fast, gpt-5.3-codex-xhigh-fast, gpt-5.2-codex-high-fast, gpt-5.2-codex-xhigh-fast, gpt-5.1-codex-max-high-fast, gpt-5.1-codex-max-xhigh-fast, gpt-5.2-xhigh-fast]
+
+  - name: coding_extreme
+    good_for: >
+      Hardest coding: architecture-sensitive changes, tricky concurrency,
+      performance work, security-critical code, subtle bugs that simpler
+      models already got wrong, large cross-cutting refactors.
+    ladder:      [gpt-5.3-codex-xhigh, gpt-5.1-codex-max-xhigh, claude-opus-4-7-thinking-low, claude-opus-4-7-thinking-medium, claude-opus-4-7-thinking-high, claude-opus-4-7-thinking-xhigh, claude-opus-4-7-thinking-max, claude-4.6-opus-high-thinking, claude-4.6-opus-max-thinking, claude-4.5-opus-high-thinking]
+    fast_ladder: [gpt-5.3-codex-xhigh-fast, gpt-5.1-codex-max-xhigh-fast]
+
+  - name: codex_spark_preview
+    good_for: >
+      Experimental coding tasks where you explicitly want to try the
+      newest Codex Spark preview models (benchmarks, evals, exploration).
+      Do NOT pick this for everyday work — use coding_medium/hard instead.
+    ladder:      [gpt-5.3-codex-spark-preview-low, gpt-5.3-codex-spark-preview, gpt-5.3-codex-spark-preview-high, gpt-5.3-codex-spark-preview-xhigh]
+    fast_ladder: []
+
+  - name: long_context_read
+    good_for: >
+      Reading and summarising large inputs (>~50KB): log triage, analysing
+      long documents, repo-wide questions, "what does this whole folder
+      do", explaining unfamiliar large code. The key property is INPUT
+      size, not output difficulty.
+    ladder:      [gemini-3-flash, gemini-3.1-pro, claude-4.6-sonnet-medium, claude-4.6-opus-high, claude-4.6-opus-max, claude-opus-4-7-low, claude-opus-4-7-medium, claude-opus-4-7-high, claude-opus-4-7-xhigh, claude-opus-4-7-max, claude-4-sonnet-1m]
+    fast_ladder: [gemini-3-flash, gemini-3.1-pro]
+
+  - name: deep_reason
+    good_for: >
+      Careful non-code reasoning: architectural proposals, design docs,
+      trade-off analysis, planning, proofs, legal-style reasoning,
+      anything that benefits from extended thinking but isn't primarily
+      code.
+    ladder:      [claude-4.6-sonnet-medium-thinking, claude-4.5-sonnet-thinking, claude-4.6-opus-high-thinking, claude-4.5-opus-high, claude-4.5-opus-high-thinking, claude-opus-4-7-thinking-high, claude-opus-4-7-thinking-max, gpt-5.1-low, gpt-5.1, gpt-5.1-high, gpt-5.4-high, gpt-5.4-xhigh, grok-4-20-thinking]
+    fast_ladder: [gpt-5.4-high-fast, gpt-5.4-xhigh-fast]
+
+  - name: agentic_tool_loop
+    good_for: >
+      Tasks that explicitly require MANY tool calls in a loop: "open
+      file X, run the tests, fix failures", "browse the codebase and
+      apply change Y everywhere", "keep iterating until all tests
+      pass". Anything with "run", "execute", "iterate", "repeat until"
+      or chained verbs belongs here. Optimise for low latency per step.
+    ladder:      [composer-2-fast, composer-2, gpt-5.3-codex-fast, gpt-5.3-codex-high-fast, claude-4.6-sonnet-medium, gpt-5.4-medium-fast]
+    fast_ladder: [composer-2-fast, gpt-5.3-codex-fast, gpt-5.3-codex-high-fast, gpt-5.4-medium-fast, gpt-5.4-high-fast]
+
+  - name: vision_or_multimodal
+    good_for: >
+      Tasks that mention images, screenshots, diagrams, charts, UI mockups.
+      (Text-only models can't see them; route to the ones that can.)
+    ladder:      [gemini-3.1-pro, gemini-3-flash, claude-4.6-opus-high, claude-opus-4-7-high]
+    fast_ladder: [gemini-3-flash]
+
+  - name: creative_long_form
+    good_for: >
+      Long-form creative writing, stories, marketing copy, blog posts,
+      brainstorming. Rewards a strong general model over a code-tuned one.
+    ladder:      [claude-4.6-sonnet-medium, claude-4.5-sonnet, claude-4.6-opus-high, gpt-5.4-medium, gpt-5.4-high, kimi-k2.5, grok-4-20]
+    fast_ladder: [gpt-5.4-medium-fast, gpt-5.4-high-fast]

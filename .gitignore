@@ -1,0 +1,28 @@
+# Runtime logs (user-specific, may contain snippets of your prompts)
+router.log
+plan.log
+judge.log
+cursor-auto.log
+
+# Prompt / plan cache (content-addressed, per-user, regenerates on demand)
+.cache/
+
+# Per-run orchestrator artifacts (task stdout, combined logs, saved plans)
+.cursor-auto-plan/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Editor / OS crud
+.DS_Store
+*.swp
+*.swo
+.idea/
+.vscode/
+
+# Local overrides
+.env
+.env.*
+*.local.yaml

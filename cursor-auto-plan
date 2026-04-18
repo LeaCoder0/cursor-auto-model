@@ -1,0 +1,280 @@
+#!/usr/bin/env bash
+# cursor-auto-plan — decompose a prompt into a DAG of tasks and, optionally,
+# execute each task by spawning cursor-agent --model <picked> --print <subtask>.
+#
+# Modes:
+#   cursor-auto-plan -p "..."               # print the plan (human-readable)
+#   cursor-auto-plan --json -p "..."        # print the plan (JSON)
+#   cursor-auto-plan --exec -p "..."        # execute the plan
+#   cursor-auto-plan --exec --dry-run -p .. # print what would be executed
+#
+# Execution details (--exec):
+#   - Tasks are run wave-by-wave. Within a wave, up to --max-parallel tasks
+#     (default 3) run concurrently.
+#   - Per-task log at .cursor-auto-plan/<run_id>/<task_id>.log (stdout+stderr).
+#   - Merged log at .cursor-auto-plan/<run_id>/combined.log and streamed
+#     to this process's stdout with per-task prefixes.
+#   - Failure policy: if any task in a wave fails, we stop launching new
+#     waves (but let the current wave finish). Override with --keep-going.
+#   - Each task is invoked as:
+#       cursor-agent --model <id> [--yolo] --print "<task.description>"
+#
+# Env passed through to the planner:
+#   ROUTER_OLLAMA_URL, ROUTER_PLANNER_URL, ROUTER_PLANNER_MODEL,
+#   ROUTER_PLANNER_TIMEOUT_SEC, ROUTER_OLLAMA_MODEL, ROUTER_TIMEOUT_SEC
+#
+# Other env:
+#   CURSOR_AGENT_BIN   override cursor-agent binary (default: cursor-agent)
+#   CAP_YOLO=1         pass --force --sandbox disabled --approve-mcps --trust
+#                      to cursor-agent (full yolo: auto-approve shell/edit,
+#                      auto-trust workspace, auto-approve MCP servers).
+#                      Default 1 for --exec (headless is useless otherwise).
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROUTER_PY="${SCRIPT_DIR}/router.py"
+CURSOR_AGENT_BIN="${CURSOR_AGENT_BIN:-cursor-agent}"
+
+PROMPT=""
+JSON_OUT=0
+DO_EXEC=0
+DRY_RUN=0
+KEEP_GOING=0
+MAX_PARALLEL=3
+EXPLAIN=0
+PASSTHROUGH=()
+
+usage() {
+  sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'
+  exit "${1:-0}"
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -p|--print)           PROMPT="${2:-}"; shift 2;;
+    --print=*)            PROMPT="${1#--print=}"; shift;;
+    --prompt)             PROMPT="${2:-}"; shift 2;;
+    --prompt=*)           PROMPT="${1#--prompt=}"; shift;;
+    --json)               JSON_OUT=1; shift;;
+    --exec)               DO_EXEC=1; shift;;
+    --dry-run)            DRY_RUN=1; shift;;
+    --keep-going)         KEEP_GOING=1; shift;;
+    --max-parallel)       MAX_PARALLEL="${2:-3}"; shift 2;;
+    --max-parallel=*)     MAX_PARALLEL="${1#--max-parallel=}"; shift;;
+    --explain)            EXPLAIN=1; shift;;
+    -h|--help)            usage 0;;
+    --)                   shift; PASSTHROUGH+=("$@"); break;;
+    *)                    PASSTHROUGH+=("$1"); shift;;
+  esac
+done
+
+# Read stdin if no -p and stdin is a pipe.
+if [ -z "$PROMPT" ] && [ ! -t 0 ]; then
+  PROMPT="$(cat)"
+fi
+
+if [ -z "$PROMPT" ]; then
+  echo "cursor-auto-plan: no prompt provided (use -p \"...\" or pipe via stdin)" >&2
+  exit 2
+fi
+
+# --- 1. ask the planner for a plan in JSON (we always need JSON internally) -
+PLAN_ARGS=(--plan --json --prompt "$PROMPT")
+if [ "$EXPLAIN" = "1" ]; then PLAN_ARGS+=(--explain); fi
+
+PLAN_JSON="$(python3 "$ROUTER_PY" "${PLAN_ARGS[@]}")"
+if [ -z "$PLAN_JSON" ]; then
+  echo "cursor-auto-plan: planner returned empty output" >&2
+  exit 3
+fi
+
+# --- 2. print the plan (or the JSON if --json) ------------------------------
+if [ "$DO_EXEC" = "0" ]; then
+  if [ "$JSON_OUT" = "1" ]; then
+    printf '%s\n' "$PLAN_JSON"
+  else
+    # Render the already-computed JSON into the human-readable format. Avoids
+    # a second planner round-trip.
+    SCRIPT_DIR="$SCRIPT_DIR" PLAN_JSON="$PLAN_JSON" python3 - <<'PY'
+import json, os, sys
+from pathlib import Path
+sys.path.insert(0, os.environ["SCRIPT_DIR"])
+import router
+plan = json.loads(os.environ["PLAN_JSON"])
+sys.stdout.write(router.render_plan_markdown(plan))
+PY
+  fi
+  exit 0
+fi
+
+# --- 3. execute the plan ----------------------------------------------------
+if [ "$DRY_RUN" = "1" ]; then JSON_OUT=1; fi
+
+RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
+LOG_DIR=".cursor-auto-plan/${RUN_ID}"
+mkdir -p "$LOG_DIR"
+
+# Persist the plan for audit.
+printf '%s\n' "$PLAN_JSON" > "$LOG_DIR/plan.json"
+
+# Build task map + waves via python (easier JSON handling than bash).
+TASK_SCRIPT="$(mktemp)"
+cat > "$TASK_SCRIPT" <<'PY'
+import json, os, sys
+plan = json.load(open(sys.argv[1]))
+# Emit: one line per task as "WAVE|ID|MODEL|DESCRIPTION".
+by_id = {t["id"]: t for t in plan["tasks"]}
+for wi, wave in enumerate(plan["waves"], start=1):
+    for tid in wave:
+        t = by_id[tid]
+        desc = t["description"].replace("\n", " ").replace("|", "¦")
+        sys.stdout.write(f"{wi}|{tid}|{t['model']}|{desc}\n")
+# Summary to stderr
+sys.stderr.write(f"{len(plan['tasks'])} tasks / {len(plan['waves'])} waves\n")
+PY
+
+mapfile -t TASK_LINES < <(python3 "$TASK_SCRIPT" "$LOG_DIR/plan.json")
+rm -f "$TASK_SCRIPT"
+
+if [ "${#TASK_LINES[@]}" -eq 0 ]; then
+  echo "cursor-auto-plan: plan has no tasks" >&2
+  exit 4
+fi
+
+echo "cursor-auto-plan: run_id=$RUN_ID  tasks=${#TASK_LINES[@]}  logs=$LOG_DIR" >&2
+
+# In --exec mode, cursor-agent is headless; without yolo it will hang on the
+# first approval prompt. Default CAP_YOLO=1 unless the user explicitly
+# disabled it with CAP_YOLO=0. Use an array so we can carry multi-word flags.
+CAP_YOLO_EFFECTIVE="${CAP_YOLO:-1}"
+YOLO_FLAGS=()
+if [ "$CAP_YOLO_EFFECTIVE" = "1" ]; then
+  YOLO_FLAGS=(--force --sandbox disabled --approve-mcps --trust)
+fi
+
+# Iterate waves.
+CURRENT_WAVE=""
+declare -a WAVE_PIDS=()
+declare -a WAVE_META=()
+WAVE_FAILED=0
+ANY_FAILED=0
+
+run_one() {
+  local tid="$1" model="$2" desc="$3"
+  local lf="$LOG_DIR/${tid}.log"
+  {
+    echo "=== task ${tid}  model=${model}  run=${RUN_ID} ==="
+    echo "=== desc: ${desc}"
+    echo "=== started: $(date -Is)"
+    echo
+  } > "$lf"
+  # Prefix-tee each line of cursor-agent output into both the per-task log
+  # and our stdout. Run in a subshell so 'set -e' doesn't kill the parent.
+  (
+    if [ "$DRY_RUN" = "1" ]; then
+      printf '[dry-run] would run: %s --model %s' "$CURSOR_AGENT_BIN" "$model"
+      for f in "${YOLO_FLAGS[@]}"; do printf ' %q' "$f"; done
+      printf ' --print <desc len=%d>\n' "${#desc}"
+      exit 0
+    fi
+    # Prompt delivery: for short prompts pass via argv (fastest, simplest).
+    # For long prompts (>64KB) pipe the prompt on stdin via `printf %s` —
+    # avoids ARG_MAX / exec environment limits and sidesteps shells that
+    # mangle very long single args. This mirrors what agent-orchestrator
+    # does for the Cursor plugin when handing off long prompts.
+    if [ "${#desc}" -gt 65536 ]; then
+      printf '%s' "$desc" | "$CURSOR_AGENT_BIN" --model "$model" "${YOLO_FLAGS[@]}" --print 2>&1
+    else
+      "$CURSOR_AGENT_BIN" --model "$model" "${YOLO_FLAGS[@]}" --print "$desc" 2>&1
+    fi
+    echo "=== exit=$? at $(date -Is)"
+  ) | while IFS= read -r line; do
+    printf '[%s] %s\n' "$tid" "$line"
+    printf '%s\n' "$line" >> "$lf"
+  done
+  # Pick up the actual cursor-agent exit status via PIPESTATUS.
+  return "${PIPESTATUS[0]}"
+}
+
+wait_one() {
+  # Wait for ANY child; return 0 on success, 1 on failure. Also shrinks
+  # WAVE_PIDS / WAVE_META in-place.
+  local pid status
+  wait -n -p pid "${WAVE_PIDS[@]}"
+  status=$?
+  # Remove that pid from arrays.
+  local -a new_pids=() new_meta=()
+  local i
+  for i in "${!WAVE_PIDS[@]}"; do
+    if [ "${WAVE_PIDS[$i]}" = "$pid" ]; then
+      local tid_meta="${WAVE_META[$i]}"
+      if [ $status -ne 0 ]; then
+        echo "[$tid_meta] FAILED (exit=$status)" >&2
+        WAVE_FAILED=1
+        ANY_FAILED=1
+      else
+        echo "[$tid_meta] ok" >&2
+      fi
+    else
+      new_pids+=("${WAVE_PIDS[$i]}")
+      new_meta+=("${WAVE_META[$i]}")
+    fi
+  done
+  WAVE_PIDS=("${new_pids[@]}")
+  WAVE_META=("${new_meta[@]}")
+}
+
+for line in "${TASK_LINES[@]}"; do
+  wi="${line%%|*}"
+  rest="${line#*|}"
+  tid="${rest%%|*}"
+  rest="${rest#*|}"
+  model="${rest%%|*}"
+  desc="${rest#*|}"
+
+  if [ "$wi" != "$CURRENT_WAVE" ]; then
+    # Drain current wave before starting a new one.
+    while [ "${#WAVE_PIDS[@]}" -gt 0 ]; do
+      wait_one || true
+    done
+    if [ "$WAVE_FAILED" = "1" ] && [ "$KEEP_GOING" = "0" ]; then
+      echo "cursor-auto-plan: wave $CURRENT_WAVE had failures; stopping." >&2
+      break
+    fi
+    WAVE_FAILED=0
+    CURRENT_WAVE="$wi"
+    echo "--- wave $wi ---" >&2
+  fi
+
+  # Respect max parallelism inside a wave.
+  while [ "${#WAVE_PIDS[@]}" -ge "$MAX_PARALLEL" ]; do
+    wait_one || true
+  done
+
+  echo "[$tid] launching  model=$model" >&2
+  run_one "$tid" "$model" "$desc" &
+  WAVE_PIDS+=("$!")
+  WAVE_META+=("$tid")
+done
+
+# Drain last wave.
+while [ "${#WAVE_PIDS[@]}" -gt 0 ]; do
+  wait_one || true
+done
+
+# Merge per-task logs into combined.log for easy post-mortem.
+{
+  for line in "${TASK_LINES[@]}"; do
+    rest="${line#*|}"; tid="${rest%%|*}"
+    echo "######## $tid ########"
+    cat "$LOG_DIR/${tid}.log" 2>/dev/null || true
+    echo
+  done
+} > "$LOG_DIR/combined.log"
+
+if [ "$ANY_FAILED" = "1" ]; then
+  echo "cursor-auto-plan: finished with failures (see $LOG_DIR)" >&2
+  exit 1
+fi
+echo "cursor-auto-plan: done (see $LOG_DIR)" >&2

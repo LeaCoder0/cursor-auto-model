@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Wrapper that runs the real cursor-agent with our fetch logger preloaded.
+#
+# Usage:   cursor-agent-logged [any cursor-agent args...]
+# Env:
+#   CURSOR_AUTO_LOG          path to log file (default ./cursor-auto.log)
+#   CURSOR_AUTO_LOG_VERBOSE  set to 1 to also echo each log line to stderr
+#   CURSOR_AUTO_LOG_SCAN_CAP max bytes of response body to scan per call
+#
+# The wrapper does NOT change cursor-agent's behaviour; it only observes
+# HTTP traffic to cursor.sh / cursor.com.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0" || echo "$0")")" && pwd)"
+LOGGER="$SCRIPT_DIR/logger.js"
+
+if [[ ! -f "$LOGGER" ]]; then
+  echo "cursor-agent-logged: logger not found at $LOGGER" >&2
+  exit 1
+fi
+
+REAL_AGENT="${CURSOR_AGENT_BIN:-$(command -v cursor-agent || true)}"
+if [[ -z "${REAL_AGENT:-}" ]]; then
+  echo "cursor-agent-logged: cursor-agent not found in PATH; set CURSOR_AGENT_BIN" >&2
+  exit 1
+fi
+
+# Resolve symlink to the versioned install so NODE_OPTIONS applies to the
+# exact Node binary the wrapper script exec's.
+REAL_AGENT="$(readlink -f "$REAL_AGENT")"
+
+: "${CURSOR_AUTO_LOG:=$PWD/cursor-auto.log}"
+export CURSOR_AUTO_LOG
+
+# --require loads our preloader before cursor-agent's bundled index.js runs.
+# We append, in case the user already set NODE_OPTIONS.
+export NODE_OPTIONS="${NODE_OPTIONS:-} --require $LOGGER"
+
+echo "[cursor-agent-logged] logging to: $CURSOR_AUTO_LOG" >&2
+exec "$REAL_AGENT" "$@"

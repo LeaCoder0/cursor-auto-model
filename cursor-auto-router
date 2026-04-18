@@ -1,0 +1,81 @@
+#!/usr/bin/env bash
+# cursor-auto-router — a drop-in wrapper for `cursor-agent` that picks the
+# best Cursor model for each prompt using a local Ollama router, and then
+# invokes `cursor-agent --model <picked> <your other args>`.
+#
+# Usage:
+#   cursor-auto-router -p "write a python fib function"
+#   cursor-auto-router --yolo -p "refactor this into async"
+#   cursor-auto-router chat   (interactive — uses default model, no routing)
+#
+# If you pass `--model <id>` yourself, we honor it and skip routing.
+# If there's no prompt to classify (e.g. interactive mode), we also skip routing.
+#
+# Env:
+#   ROUTER_DISABLE=1           disable routing, pass through untouched
+#   ROUTER_OLLAMA_MODEL=...    override router LLM (default qwen2.5:latest)
+#   ROUTER_OLLAMA_URL=...      override Ollama URL
+#   ROUTER_EXPLAIN=1           print chosen model + reason to stderr
+#   CURSOR_AGENT_BIN=...       override `cursor-agent` binary path
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+CURSOR_AGENT_BIN="${CURSOR_AGENT_BIN:-cursor-agent}"
+ROUTER_PY="${SCRIPT_DIR}/router.py"
+
+# Parse args once so we can (a) detect --model, (b) extract -p/--print prompt,
+# (c) leave everything else intact.
+ARGS=("$@")
+USER_MODEL=""
+PROMPT=""
+HAS_PROMPT_FLAG=0
+
+i=0
+while [ $i -lt ${#ARGS[@]} ]; do
+  a="${ARGS[$i]}"
+  case "$a" in
+    --model)
+      USER_MODEL="${ARGS[$((i+1))]:-}"
+      i=$((i+2)); continue
+      ;;
+    --model=*)
+      USER_MODEL="${a#--model=}"
+      i=$((i+1)); continue
+      ;;
+    -p|--print)
+      HAS_PROMPT_FLAG=1
+      PROMPT="${ARGS[$((i+1))]:-}"
+      i=$((i+2)); continue
+      ;;
+    --print=*)
+      HAS_PROMPT_FLAG=1
+      PROMPT="${a#--print=}"
+      i=$((i+1)); continue
+      ;;
+  esac
+  i=$((i+1))
+done
+
+# If stdin is piped and no explicit -p text, read stdin as the prompt.
+if [ -z "$PROMPT" ] && [ "$HAS_PROMPT_FLAG" = "0" ] && [ ! -t 0 ]; then
+  PROMPT="$(cat)"
+fi
+
+# Short-circuits — pass through unchanged.
+if [ "${ROUTER_DISABLE:-0}" = "1" ] || [ -n "$USER_MODEL" ] || [ -z "$PROMPT" ]; then
+  exec "$CURSOR_AGENT_BIN" "${ARGS[@]}"
+fi
+
+# Ask the router for a model id.
+EXPLAIN_FLAG=""
+if [ "${ROUTER_EXPLAIN:-0}" = "1" ]; then EXPLAIN_FLAG="--explain"; fi
+
+PICKED="$(printf '%s' "$PROMPT" | python3 "$ROUTER_PY" $EXPLAIN_FLAG)"
+
+if [ -z "$PICKED" ]; then
+  # Router completely failed to produce an id; let cursor-agent use its default.
+  exec "$CURSOR_AGENT_BIN" "${ARGS[@]}"
+fi
+
+exec "$CURSOR_AGENT_BIN" --model "$PICKED" "${ARGS[@]}"
