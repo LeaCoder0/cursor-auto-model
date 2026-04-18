@@ -12,6 +12,7 @@ planner.
 - **SHA-256 prompt cache** — cold classify 5–7 s, warm hit ~55 ms.
 - **Regex intent fast-path** — trivial prompts (greetings, typo fixes, `rename X to Y`, …) skip Ollama entirely (~70 ms).
 - **Agent role registry** — `agents/*.yaml` defines personas (`coder`, `reviewer`, `tester`, `architect`, `security-architect`, `doc-writer`). Planner picks one per task; orchestrator prepends the role's system prompt to `cursor-agent --print`.
+- **Learned routing memory** — `router.py --learn` distills `judge.log` into `memory.json`. With `ROUTER_MEMORY=1`, future routes for matching prompt signatures use the learned bucket override (~1 ms hit, no Ollama call).
 - **Optional LLM-as-judge** on a sample of runs for offline quality signal.
 - **Safe by default**: on any failure, falls back to a known-good model and exits 0.
 
@@ -67,6 +68,7 @@ On any parse / classify / Ollama failure at any stage, we fall back to a default
 | [`models.yaml`](./models.yaml) | Bucket → ladder configuration. The only place model policy lives. |
 | [`fastpath.yaml`](./fastpath.yaml) | Regex intent shortcuts. Matches bypass the Ollama classifier. Edit freely; `router.py --validate` lints it. |
 | [`agents/`](./agents) | One YAML per persona (system-prompt preamble, optional bucket/effort hints). `agents/README.md` documents the schema. |
+| `memory.json` (gitignored) | Distilled bucket overrides, written by `router.py --learn`. |
 | [`cursor-models.tsv`](./cursor-models.tsv) | Authoritative list of Cursor model ids (dumped from `cursor-agent --list-models`). |
 | [`cursor-auto-router`](./cursor-auto-router) | Bash wrapper: classify → `cursor-agent --model <picked>`. |
 | [`cursor-auto-plan`](./cursor-auto-plan) | Bash orchestrator: plan → wave-parallel execution. |
@@ -111,6 +113,30 @@ self-contained in its own directory.
 |---|---|---|
 | `ROUTER_ROLES` | `1` | `0` disables role personas entirely (planner stops emitting `role`, orchestrator stops prepending preambles) |
 | `ROUTER_ROLES_DIR` | `./agents` | Override the directory scanned for `*.yaml` personas |
+
+### Learned routing memory
+
+Closes the loop between the LLM-as-judge log and future routing decisions.
+
+```bash
+# Step 1: enable judging on a sample of runs (writes judge.log).
+export ROUTER_JUDGE_SAMPLE=0.2
+# ... run your normal routing for a while ...
+
+# Step 2: distill the judge log into memory.json (one-shot, off-line).
+python3 router.py --learn
+
+# Step 3: opt in to use the learned overrides at runtime.
+export ROUTER_MEMORY=1
+```
+
+| Variable | Default | What it controls |
+|---|---|---|
+| `ROUTER_MEMORY` | `0` (off) | `1` enables `memory.json` lookups in the classifier path |
+| `ROUTER_MEMORY_FILE` | `./memory.json` | Override the memory file location |
+| `ROUTER_MEMORY_MIN_AGREE` | `3` | Minimum independent judge votes required before learning an override |
+
+Memory is **read-only at runtime**. `--learn` is the only writer. Overrides require ≥`min_agree` independent judge agreements **and** a >60% majority on the suggested bucket — one angry verdict cannot rewrite the world.
 
 ### Cache
 

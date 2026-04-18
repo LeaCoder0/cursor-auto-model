@@ -23,6 +23,7 @@ Usage:
   router.py --prompt "..." --explain   # prints picked id + reason to stderr
   router.py --prompt "..." --dry-run   # don't print id to stdout
   router.py --prompt "..." --no-fastpath   # skip regex fast-path, force Ollama
+  router.py --learn                    # distill judge.log -> memory.json
   router.py --validate                 # check every ladder id exists in cursor-models.tsv
 
   # Planner mode: decompose a prompt into tasks + a wave-ordered DAG.
@@ -44,6 +45,9 @@ Env:
   ROUTER_FASTPATH_FILE  (default <script_dir>/fastpath.yaml) — regex rules
   ROUTER_ROLES          (default 1) — 0 disables role system-prompt prepending
   ROUTER_ROLES_DIR      (default <script_dir>/agents) — role YAML directory
+  ROUTER_MEMORY         (default 0) — 1 enables learned-memory bucket overrides
+  ROUTER_MEMORY_FILE    (default <script_dir>/memory.json) — distilled overrides
+  ROUTER_MEMORY_MIN_AGREE (default 3) — min judge votes to learn an override
   ROUTER_CACHE_DIR      (default <script_dir>/.cache) — prompt → decision cache
   ROUTER_CACHE_TTL_SEC  (default 604800, one week) — 0 disables cache entirely
   ROUTER_JUDGE_SAMPLE   (default 0.0) — fraction [0,1] of completed runs to
@@ -1423,6 +1427,227 @@ def _run_judge_one() -> int:
 
 
 # ---------------------------------------------------------------------------
+# Learned routing memory.
+#
+# This is the DISTILL + CONSOLIDATE half of ruflo's
+#   RETRIEVE -> JUDGE -> DISTILL -> CONSOLIDATE -> ROUTE
+# loop, adapted to our stack:
+#
+#   JUDGE        -> already done in T1 (judge.log).
+#   DISTILL      -> `router.py --learn` reads judge.log, groups verdicts by
+#                   (prompt_signature, picked_bucket), and emits memory.json.
+#   CONSOLIDATE  -> only "wrong_bucket" verdicts with sufficient agreement
+#                   (>= MEMORY_MIN_AGREE, default 3) become overrides.
+#   RETRIEVE     -> on each classify, we hash the current prompt the same way
+#                   and look it up in memory.json BEFORE calling Ollama.
+#   ROUTE        -> a memory hit short-circuits to the suggested bucket.
+#                   resolve_id() then turns that bucket into a Cursor model.
+#
+# Safety properties:
+#   - Memory is OFF by default (ROUTER_MEMORY=1 to enable). We only opt
+#     users in once they've explicitly run --learn at least once.
+#   - Memory is read-only at runtime. The ONLY writer is `--learn`.
+#   - We require N independent agreements (default 3) before overriding.
+#     One angry judge call cannot rewrite the world.
+#   - We require a SINGLE majority bucket among judges. A tie is no-op.
+#   - Memory hits are logged with {"memory": "<sig>"} in router.log so we
+#     can audit drift.
+#
+# Prompt signature:
+#   Lowercase, drop non-alphanumerics, dedupe words, sort the first 12
+#   alphabetically, join with single spaces. Bag-of-words. Crude but
+#   robust to paraphrase: "fix typo in readme" and "fix the typo in
+#   README.md" produce the same signature.
+# ---------------------------------------------------------------------------
+
+MEMORY_MIN_AGREE_DEFAULT = 3
+MEMORY_MAX_WORDS = 12
+
+
+def _memory_enabled() -> bool:
+    return os.environ.get("ROUTER_MEMORY", "0") == "1"
+
+
+def prompt_signature(prompt: str) -> str:
+    """
+    Compute a paraphrase-robust signature for `prompt`. Returns "" for an
+    effectively empty prompt (so callers can short-circuit).
+    """
+    if not prompt:
+        return ""
+    norm = re.sub(r"[^a-z0-9\s]+", " ", prompt.lower())
+    words = [w for w in norm.split() if w]
+    if not words:
+        return ""
+    # Dedupe while preserving discovery order, then sort the first N.
+    seen: set[str] = set()
+    unique: list[str] = []
+    for w in words:
+        if w in seen:
+            continue
+        seen.add(w)
+        unique.append(w)
+    return " ".join(sorted(unique[:MEMORY_MAX_WORDS]))
+
+
+def _memory_path(args_path: str | None = None) -> Path:
+    return Path(args_path or os.environ.get("ROUTER_MEMORY_FILE", str(SCRIPT_DIR / "memory.json")))
+
+
+def load_memory(path: Path) -> dict:
+    """
+    Returns {"version": 1, "entries": {sig: {bucket, support, ...}}}.
+    Missing / corrupt file => empty memory (no overrides).
+    """
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {"version": 1, "entries": {}}
+    if not isinstance(data, dict) or "entries" not in data:
+        return {"version": 1, "entries": {}}
+    return data
+
+
+def memory_lookup(memory: dict, prompt: str, valid_buckets: set[str]) -> tuple[str | None, dict | None]:
+    """
+    Returns (suggested_bucket, entry_dict) on a confident hit. (None, None)
+    otherwise. We re-validate the bucket is real on each lookup so memory
+    survives bucket renames in models.yaml without exploding (orphan
+    entries just become no-ops).
+    """
+    sig = prompt_signature(prompt)
+    if not sig:
+        return None, None
+    entry = memory.get("entries", {}).get(sig)
+    if not entry:
+        return None, None
+    bucket = entry.get("bucket")
+    if not isinstance(bucket, str) or bucket not in valid_buckets:
+        return None, None
+    return bucket, entry
+
+
+def _learn_from_judge_log(
+    judge_log_path: Path,
+    out_path: Path,
+    min_agree: int,
+) -> dict:
+    """
+    Build (or update) memory.json from judge.log. Returns a stats dict
+    suitable for printing.
+
+    Algorithm:
+      For every judge entry where verdict is "wrong_bucket" or "under" or
+      "over" with a `suggested_bucket`, accumulate
+        votes[sig][suggested_bucket] += weight
+      where weight = max(0.5, confidence). Also count `votes[sig].total`.
+      An entry becomes an override iff:
+        - the leading bucket has >= min_agree votes
+        - the leading bucket has > 60% share of total votes
+      Existing memory.json entries are PRESERVED unless this run produces
+      a stronger override for the same sig (more votes).
+    """
+    stats = {
+        "judge_lines_read": 0,
+        "judge_lines_usable": 0,
+        "signatures_seen": 0,
+        "overrides_written": 0,
+        "overrides_kept": 0,
+        "min_agree": min_agree,
+    }
+    if not judge_log_path.exists():
+        return stats
+
+    # signature -> {bucket -> [vote_weight, ...]}
+    votes: dict[str, dict[str, list[float]]] = {}
+    samples: dict[str, list[str]] = {}
+
+    with judge_log_path.open() as fh:
+        for line in fh:
+            stats["judge_lines_read"] += 1
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            verdict = ev.get("verdict")
+            if not isinstance(verdict, dict):
+                continue
+            v = verdict.get("verdict")
+            sb = verdict.get("suggested_bucket")
+            head = ev.get("prompt_head") or ""
+            picked_bucket = ev.get("bucket")
+            if v not in ("wrong_bucket", "over", "under") or not sb or not head:
+                continue
+            if sb == picked_bucket:
+                # Judge "disagreed" but suggested the same bucket — useless.
+                continue
+            sig = prompt_signature(head)
+            if not sig:
+                continue
+            try:
+                conf = float(verdict.get("confidence", 0.5))
+            except (TypeError, ValueError):
+                conf = 0.5
+            weight = max(0.5, min(1.0, conf))
+            votes.setdefault(sig, {}).setdefault(sb, []).append(weight)
+            samples.setdefault(sig, []).append(head[:120])
+            stats["judge_lines_usable"] += 1
+
+    stats["signatures_seen"] = len(votes)
+
+    # Load + merge.
+    existing = load_memory(out_path)
+    entries = dict(existing.get("entries") or {})
+
+    for sig, by_bucket in votes.items():
+        total_votes = sum(len(v) for v in by_bucket.values())
+        if total_votes < min_agree:
+            continue
+        # Find leading bucket.
+        leader = max(by_bucket.items(), key=lambda kv: (sum(kv[1]), len(kv[1])))
+        lead_bucket, lead_weights = leader
+        lead_count = len(lead_weights)
+        lead_score = sum(lead_weights)
+        if lead_count < min_agree:
+            continue
+        if lead_score / max(total_votes, 1) <= 0.6:
+            continue
+
+        new_entry = {
+            "bucket": lead_bucket,
+            "support": lead_count,
+            "score": round(lead_score, 3),
+            "total_votes": total_votes,
+            "examples": samples[sig][:3],
+            "updated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        prev = entries.get(sig)
+        # Keep the previous entry if it's stronger (more votes).
+        if prev and prev.get("support", 0) > lead_count:
+            stats["overrides_kept"] += 1
+            continue
+        entries[sig] = new_entry
+        stats["overrides_written"] += 1
+
+    out = {
+        "version": 1,
+        "generated": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "min_agree": min_agree,
+        "entries": entries,
+    }
+    tmp = out_path.with_suffix(out_path.suffix + ".tmp")
+    try:
+        tmp.write_text(json.dumps(out, indent=2, sort_keys=True))
+        tmp.replace(out_path)
+    except OSError as e:
+        stats["error"] = f"{type(e).__name__}: {e}"
+    return stats
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -1451,6 +1676,13 @@ def main() -> int:
     ap.add_argument("--no-fastpath", action="store_true", help="disable regex intent fast-path for this invocation")
     ap.add_argument("--roles-dir", default=os.environ.get("ROUTER_ROLES_DIR", str(SCRIPT_DIR / "agents")))
     ap.add_argument("--no-roles", action="store_true", help="ignore agents/*.yaml; do not attach role personas to plan tasks")
+    ap.add_argument("--memory-file", default=os.environ.get("ROUTER_MEMORY_FILE", str(SCRIPT_DIR / "memory.json")))
+    ap.add_argument("--no-memory", action="store_true", help="skip memory.json lookup for this invocation")
+    ap.add_argument("--learn", action="store_true", help="distill judge.log into memory.json overrides and exit")
+    ap.add_argument("--memory-min-agree", type=int, default=int(os.environ.get("ROUTER_MEMORY_MIN_AGREE", str(MEMORY_MIN_AGREE_DEFAULT))),
+                    help="minimum number of judge agreements required to learn an override")
+    ap.add_argument("--judge-log-file", default=os.environ.get("ROUTER_JUDGE_LOG_FILE", str(SCRIPT_DIR / "judge.log")),
+                    help="judge.log path used by --learn")
     args = ap.parse_args()
 
     models_path = Path(args.models_file)
@@ -1511,6 +1743,23 @@ def main() -> int:
                 print(f"  ! {p}")
             return 1
         print("  ok: every ladder entry is a real Cursor model id")
+        return 0
+
+    if args.learn:
+        judge_path = Path(args.judge_log_file)
+        mem_path = Path(args.memory_file)
+        if not judge_path.exists():
+            print(f"router: no judge log to learn from ({judge_path})", file=sys.stderr)
+            return 0
+        stats = _learn_from_judge_log(judge_path, mem_path, args.memory_min_agree)
+        if "error" in stats:
+            print(f"router: learn failed: {stats['error']}", file=sys.stderr)
+            return 1
+        print(f"router: learn — read {stats['judge_lines_read']} judge lines, "
+              f"{stats['judge_lines_usable']} usable across {stats['signatures_seen']} signature(s); "
+              f"wrote {stats['overrides_written']} override(s), "
+              f"kept {stats['overrides_kept']} stronger existing override(s) "
+              f"(min_agree={stats['min_agree']}). memory file: {mem_path}")
         return 0
 
     prompt = args.prompt
@@ -1607,6 +1856,32 @@ def main() -> int:
                 fastpath_rule = fp_rule
                 reason = f"fastpath:{fp_rule} | {fp_note}"
 
+    # Learned memory: consult memory.json for a prior judge-driven override
+    # for this prompt's signature. Memory is OFF by default; the user must
+    # ROUTER_MEMORY=1 (and run --learn at least once) to opt in.
+    memory_sig: str | None = None
+    if picked_id is None and _memory_enabled() and not args.no_memory:
+        mem = load_memory(Path(args.memory_file))
+        sig = prompt_signature(prompt)
+        suggested, mem_entry = memory_lookup(mem, prompt, valid_buckets)
+        if suggested is not None:
+            # Memory only carries a bucket. We default latency/effort to
+            # normal/normal and let resolve_id pick the bottom of the
+            # ladder — this is the cheapest defensible model for that
+            # bucket. Effort/latency stay configurable for the future.
+            mem_picked, mem_note = resolve_id(cfg, suggested, "normal", "normal")
+            if mem_picked and (not catalogue or mem_picked in catalogue):
+                picked_id = mem_picked
+                parsed = {
+                    "bucket": suggested,
+                    "latency": "normal",
+                    "effort": "normal",
+                    "reason": f"memory override (support={mem_entry.get('support')}, "
+                              f"score={mem_entry.get('score')})",
+                }
+                memory_sig = sig
+                reason = f"memory:{sig[:40]} | {mem_note}"
+
     if picked_id is None:
         try:
             llm_prompt = build_prompt(cfg, prompt)
@@ -1658,6 +1933,7 @@ def main() -> int:
         "dur_ms": dur_ms,
         "cache": cache_status,
         "fastpath": fastpath_rule,
+        "memory": memory_sig,
     })
 
     # Fire-and-forget LLM-as-judge. Disabled by default; user opts in with
@@ -1677,6 +1953,8 @@ def main() -> int:
             tag = " (cache hit)"
         elif fastpath_rule:
             tag = " (fastpath)"
+        elif memory_sig:
+            tag = " (memory)"
         else:
             tag = ""
         print(f"router: picked {picked_id} — {reason}{tag} ({dur_ms}ms)", file=sys.stderr)

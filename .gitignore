@@ -10,6 +10,10 @@ cursor-auto.log
 # Per-run orchestrator artifacts (task stdout, combined logs, saved plans)
 .cursor-auto-plan/
 
+# Learned routing memory — derived from your local judge.log; user-specific.
+memory.json
+memory.*.json
+
 # Python bytecode
 __pycache__/
 *.pyc
