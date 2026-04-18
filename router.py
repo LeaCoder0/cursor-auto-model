@@ -48,6 +48,8 @@ Env:
   ROUTER_MEMORY         (default 0) — 1 enables learned-memory bucket overrides
   ROUTER_MEMORY_FILE    (default <script_dir>/memory.json) — distilled overrides
   ROUTER_MEMORY_MIN_AGREE (default 3) — min judge votes to learn an override
+  ROUTER_SCORING        (default 1) — 0 falls back to legacy ladder[tier] picker
+  ROUTER_HEALTH_FILE    (default <script_dir>/health.json) — per-model block list
   ROUTER_CACHE_DIR      (default <script_dir>/.cache) — prompt → decision cache
   ROUTER_CACHE_TTL_SEC  (default 604800, one week) — 0 disables cache entirely
   ROUTER_JUDGE_SAMPLE   (default 0.0) — fraction [0,1] of completed runs to
@@ -60,6 +62,7 @@ Env:
 from __future__ import annotations
 
 import argparse
+import datetime
 import hashlib
 import json
 import os
@@ -566,15 +569,219 @@ def validate_buckets(cfg: dict, catalogue: set[str]) -> list[str]:
 # Resolver: (bucket, latency, effort) -> concrete id.
 # ---------------------------------------------------------------------------
 
-def resolve_id(cfg: dict, bucket_name: str, latency: str, effort: str) -> tuple[str, str]:
+# ---------------------------------------------------------------------------
+# Multi-policy scorer (T2.D).
+#
+# The legacy resolve_id() picks ladder[tier] by index. That's brittle when a
+# model is unhealthy or expensive — there's no graceful skip.
+#
+# We replace it with a small scoring pass over every candidate in the
+# (relevant) ladder. Three policies vote, weights sum to 1.0:
+#
+#   capability  weight 0.6   how well the candidate matches the requested
+#                            effort tier (1.0 perfect, 0.7 one off, 0.4 far)
+#   cost        weight 0.2   1.0 fast / 0.5 normal / 0.2 thinking — inferred
+#                            from the model id substring (no extra config)
+#   health      weight 0.2   1.0 by default; 0.0 if the id appears in
+#                            health.json's blocked map and the until-deadline
+#                            hasn't passed
+#
+# Capability is dominant on purpose: the user said "max effort" so a max-tier
+# model SHOULD win over a cheaper but less capable one. Cost and health are
+# tiebreakers / safety nets, not the primary signal.
+#
+# health.json (manually editable for now, no auto-collection):
+#   {
+#     "version": 1,
+#     "blocked": {
+#       "<model-id>": {"reason": "rate-limited", "until": "2026-04-19T00:00Z"}
+#     }
+#   }
+# An entry with `until` in the past is ignored. An entry with no `until` is
+# treated as permanent (until you delete it).
+#
+# Set ROUTER_SCORING=0 to fall back to the legacy ladder[tier] behaviour
+# entirely (kept available as a safety net during the rollout).
+# ---------------------------------------------------------------------------
+
+POLICY_WEIGHTS = {"capability": 0.6, "cost": 0.2, "health": 0.2}
+
+
+def _scoring_enabled() -> bool:
+    return os.environ.get("ROUTER_SCORING", "1") != "0"
+
+
+_HEALTH_CACHE: tuple[dict, float] | None = None
+
+
+def load_health(path: Path) -> dict:
     """
-    Pick one id from the bucket's ladder.
+    Returns {"version": 1, "blocked": {id: {reason, until?}}}. Missing or
+    corrupt file -> empty health (everyone is healthy).
+    """
+    global _HEALTH_CACHE
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return {"version": 1, "blocked": {}}
+    if _HEALTH_CACHE is not None and _HEALTH_CACHE[1] == mtime:
+        return _HEALTH_CACHE[0]
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    blocked = data.get("blocked") or {}
+    if not isinstance(blocked, dict):
+        blocked = {}
+    out = {"version": 1, "blocked": blocked}
+    _HEALTH_CACHE = (out, mtime)
+    return out
 
-      - `latency="fast"` prefers `fast_ladder` when non-empty.
-      - `effort="max"` escalates toward the end of the ladder.
-      - `effort="normal"` stays near the front.
 
-    Returns (id, note).
+def _is_blocked_now(entry: dict) -> bool:
+    if not isinstance(entry, dict):
+        return False
+    until = entry.get("until")
+    if not isinstance(until, str) or not until:
+        return True
+    try:
+        # Accept "Z", "+00:00", and naive ISO. Compare as UTC.
+        s = until.rstrip("Z")
+        try:
+            until_dt = datetime.datetime.fromisoformat(s)
+        except ValueError:
+            return True  # malformed → assume blocked (safer)
+        if until_dt.tzinfo is None:
+            until_dt = until_dt.replace(tzinfo=datetime.timezone.utc)
+        return until_dt > datetime.datetime.now(datetime.timezone.utc)
+    except Exception:
+        return True
+
+
+def _capability_score(idx: int, ladder_len: int, effort: str) -> float:
+    """
+    Map (effort, position-in-ladder) to a capability score in [0,1].
+    Position 0 is cheapest; position -1 is strongest.
+
+    For effort=normal the BOTTOM of the ladder is "perfect"; for effort=max
+    the TOP is perfect.
+    """
+    if ladder_len <= 1:
+        return 1.0
+    norm_pos = idx / (ladder_len - 1)  # 0.0 .. 1.0
+    if effort == "max":
+        target = 1.0
+    elif effort == "high":
+        target = 0.75
+    else:
+        target = 0.0
+    dist = abs(norm_pos - target)
+    if dist <= 0.05:
+        return 1.0
+    if dist <= 0.25:
+        return 0.7
+    return 0.4
+
+
+def _cost_score(model_id: str) -> float:
+    """
+    Cheap heuristic: substring sniff on the id. We don't have authoritative
+    pricing here so we use the well-known naming conventions:
+      - 'fast' / 'flash' / '-mini' / 'haiku' / 'tinyllama' => cheap (1.0)
+      - 'thinking' / 'opus' / 'extreme' / 'high' / 'max' / '1m' => pricey (0.2)
+      - everything else => normal (0.5)
+    """
+    s = model_id.lower()
+    cheap_marks = ("fast", "flash", "-mini", "haiku", "small")
+    pricey_marks = ("thinking", "opus", "extreme", "-1m", "1m-")
+    if any(m in s for m in cheap_marks):
+        return 1.0
+    if any(m in s for m in pricey_marks):
+        return 0.2
+    if "high" in s or "max" in s:
+        return 0.4
+    return 0.5
+
+
+def _health_score(model_id: str, health: dict) -> float:
+    blocked = (health.get("blocked") or {}).get(model_id)
+    return 0.0 if blocked and _is_blocked_now(blocked) else 1.0
+
+
+def score_candidates(
+    cfg: dict,
+    bucket_name: str,
+    latency: str,
+    effort: str,
+    health: dict,
+    catalogue: set[str] | None = None,
+) -> list[dict]:
+    """
+    Return a list of {id, capability, cost, health, total, blocked} dicts,
+    sorted by total descending (then by cost descending so cheaper wins ties).
+    Empty list if the bucket / ladder is empty. Models not in the catalogue
+    are excluded entirely (they can't be picked anyway).
+    """
+    buckets = cfg.get("buckets") or []
+    bucket = next((b for b in buckets if b.get("name") == bucket_name), None)
+    if bucket is None:
+        return []
+    use_fast = (latency == "fast") and bool(bucket.get("fast_ladder"))
+    ladder_raw = bucket.get("fast_ladder") if use_fast else bucket.get("ladder")
+    ladder = [x for x in (ladder_raw or []) if isinstance(x, str)]
+    if not ladder:
+        return []
+
+    out: list[dict] = []
+    for idx, mid in enumerate(ladder):
+        if catalogue and mid not in catalogue:
+            continue
+        cap = _capability_score(idx, len(ladder), effort)
+        cost = _cost_score(mid)
+        hp = _health_score(mid, health)
+        total = (
+            POLICY_WEIGHTS["capability"] * cap
+            + POLICY_WEIGHTS["cost"] * cost
+            + POLICY_WEIGHTS["health"] * hp
+        )
+        out.append({
+            "id": mid,
+            "capability": round(cap, 3),
+            "cost": round(cost, 3),
+            "health": round(hp, 3),
+            "total": round(total, 3),
+            "blocked": hp == 0.0,
+            "ladder_pos": idx,
+            "ladder_len": len(ladder),
+            "fast_ladder": use_fast,
+        })
+    # Sort by total desc, then cost desc (cheaper wins tie), then ladder_pos asc.
+    out.sort(key=lambda d: (-d["total"], -d["cost"], d["ladder_pos"]))
+    return out
+
+
+def resolve_id(
+    cfg: dict,
+    bucket_name: str,
+    latency: str,
+    effort: str,
+    *,
+    catalogue: set[str] | None = None,
+    health: dict | None = None,
+) -> tuple[str, str]:
+    """
+    Pick one Cursor model id for (bucket, latency, effort).
+
+    By default (ROUTER_SCORING=1, the new path) we use the multi-policy
+    scorer over the bucket's ladder, with health-blocked models excluded.
+    With ROUTER_SCORING=0 we fall back to the legacy ladder[tier] index
+    behaviour (kept as a safety net).
+
+    Returns (id, note). Note string includes scoring breakdown when
+    scoring is on, or the legacy "ladder[tier]" note otherwise — so
+    log readers can tell which path produced a decision.
     """
     buckets = cfg.get("buckets") or []
     bucket = next((b for b in buckets if b.get("name") == bucket_name), None)
@@ -582,23 +789,47 @@ def resolve_id(cfg: dict, bucket_name: str, latency: str, effort: str) -> tuple[
         return cfg.get("default_id"), f"unknown bucket {bucket_name!r}; used default_id"
 
     use_fast = (latency == "fast") and bool(bucket.get("fast_ladder"))
-    ladder = bucket.get("fast_ladder") if use_fast else bucket.get("ladder")
-    ladder = [x for x in (ladder or []) if isinstance(x, str)]
+    ladder = [x for x in (bucket.get("fast_ladder") if use_fast else bucket.get("ladder")) or [] if isinstance(x, str)]
     if not ladder:
         return cfg.get("default_id"), f"bucket {bucket_name!r} has empty ladder; used default_id"
 
-    if effort == "max":
-        pick = ladder[-1]
-        tier = "max"
-    elif effort == "high":
-        pick = ladder[min(len(ladder) - 1, max(1, len(ladder) * 3 // 4))]
-        tier = "high"
-    else:
-        # "normal" → take the first entry; that's the cheapest ladder step.
-        pick = ladder[0]
-        tier = "normal"
-    note = f"bucket={bucket_name} latency={latency} effort={effort} → {'fast' if use_fast else 'normal'} ladder[{tier}]"
-    return pick, note
+    # ---- LEGACY PATH (ROUTER_SCORING=0) ------------------------------------
+    if not _scoring_enabled():
+        if effort == "max":
+            pick = ladder[-1]
+            tier = "max"
+        elif effort == "high":
+            pick = ladder[min(len(ladder) - 1, max(1, len(ladder) * 3 // 4))]
+            tier = "high"
+        else:
+            pick = ladder[0]
+            tier = "normal"
+        note = f"bucket={bucket_name} latency={latency} effort={effort} → {'fast' if use_fast else 'normal'} ladder[{tier}] (legacy)"
+        return pick, note
+
+    # ---- SCORING PATH (default) --------------------------------------------
+    health = health if health is not None else load_health(_health_path())
+    cands = score_candidates(cfg, bucket_name, latency, effort,
+                             health=health, catalogue=catalogue)
+    if cands:
+        winner = cands[0]
+        note = (
+            f"bucket={bucket_name} latency={latency} effort={effort} → "
+            f"scored[{winner['id']} cap={winner['capability']} cost={winner['cost']} "
+            f"health={winner['health']} total={winner['total']}] of {len(cands)} cand(s)"
+        )
+        return winner["id"], note
+
+    # If scoring excluded everything (e.g. all blocked + catalogue mismatch),
+    # fall back to the bottom of the ladder so we always return a usable id.
+    return ladder[0], (
+        f"bucket={bucket_name} latency={latency} effort={effort} → all candidates "
+        f"excluded by health/catalogue; fell back to ladder[0]={ladder[0]}"
+    )
+
+
+def _health_path() -> Path:
+    return Path(os.environ.get("ROUTER_HEALTH_FILE", str(SCRIPT_DIR / "health.json")))
 
 
 # ---------------------------------------------------------------------------
@@ -1036,7 +1267,7 @@ def _validate_and_enrich_plan(
         reads = [str(x) for x in (t.get("reads") or []) if isinstance(x, (str, int))]
         writes = [str(x) for x in (t.get("writes") or []) if isinstance(x, (str, int))]
 
-        mid, note = resolve_id(cfg, bucket, latency, effort)
+        mid, note = resolve_id(cfg, bucket, latency, effort, catalogue=catalogue)
         if not mid or (catalogue and mid not in catalogue):
             mid = default_id
             note = (note or "") + " | resolver fallback → default_id"
@@ -1245,7 +1476,7 @@ def _single_task_fallback(cfg: dict, catalogue: set[str], user_prompt: str) -> d
     except Exception:
         pass
 
-    mid, note = resolve_id(cfg, bucket, latency, effort)
+    mid, note = resolve_id(cfg, bucket, latency, effort, catalogue=catalogue)
     if not mid or (catalogue and mid not in catalogue):
         mid = default_id
     return {
@@ -1683,6 +1914,10 @@ def main() -> int:
                     help="minimum number of judge agreements required to learn an override")
     ap.add_argument("--judge-log-file", default=os.environ.get("ROUTER_JUDGE_LOG_FILE", str(SCRIPT_DIR / "judge.log")),
                     help="judge.log path used by --learn")
+    ap.add_argument("--health-file", default=os.environ.get("ROUTER_HEALTH_FILE", str(SCRIPT_DIR / "health.json")),
+                    help="per-model block list consulted by the multi-policy scorer")
+    ap.add_argument("--score", action="store_true",
+                    help="dump the scored candidate list for the prompt's resolved bucket and exit")
     args = ap.parse_args()
 
     models_path = Path(args.models_file)
@@ -1760,6 +1995,35 @@ def main() -> int:
               f"wrote {stats['overrides_written']} override(s), "
               f"kept {stats['overrides_kept']} stronger existing override(s) "
               f"(min_agree={stats['min_agree']}). memory file: {mem_path}")
+        return 0
+
+    if args.score:
+        # Debug: dump scored candidate table for a (bucket, latency, effort)
+        # tuple. Reads the bucket from --prompt as "bucket[/latency[/effort]]"
+        # for offline inspection without invoking Ollama.
+        spec = (args.prompt or "").strip() or sys.stdin.read().strip()
+        parts = [p for p in re.split(r"[/\s,]+", spec) if p]
+        if not parts or parts[0] not in valid_buckets:
+            print(f"router: --score expects 'bucket[/latency[/effort]]'. Got {spec!r}.\n"
+                  f"        Buckets: {sorted(valid_buckets)}", file=sys.stderr)
+            return 2
+        bucket = parts[0]
+        latency = parts[1] if len(parts) > 1 and parts[1] in ("fast", "normal") else "normal"
+        effort = parts[2] if len(parts) > 2 and parts[2] in ("normal", "high", "max") else "normal"
+        health = load_health(Path(args.health_file))
+        cands = score_candidates(cfg, bucket, latency, effort, health=health, catalogue=catalogue)
+        print(f"router: scored {len(cands)} candidate(s) for "
+              f"bucket={bucket} latency={latency} effort={effort}")
+        if not cands:
+            print("  (no candidates after catalogue/health filtering)")
+            return 0
+        # Aligned table.
+        widths = max((len(c["id"]) for c in cands), default=20)
+        print(f"  {'#':>2}  {'id':<{widths}}  cap   cost  health  total  blocked")
+        for i, c in enumerate(cands, 1):
+            print(f"  {i:>2}  {c['id']:<{widths}}  "
+                  f"{c['capability']:.2f}  {c['cost']:.2f}  {c['health']:.2f}   "
+                  f"{c['total']:.3f}  {('yes' if c['blocked'] else 'no')}")
         return 0
 
     prompt = args.prompt
@@ -1849,6 +2113,7 @@ def main() -> int:
         if fp_decision is not None and fp_decision["bucket"] in valid_buckets:
             fp_picked, fp_note = resolve_id(
                 cfg, fp_decision["bucket"], fp_decision["latency"], fp_decision["effort"],
+                catalogue=catalogue,
             )
             if fp_picked and (not catalogue or fp_picked in catalogue):
                 picked_id = fp_picked
@@ -1869,7 +2134,7 @@ def main() -> int:
             # normal/normal and let resolve_id pick the bottom of the
             # ladder — this is the cheapest defensible model for that
             # bucket. Effort/latency stay configurable for the future.
-            mem_picked, mem_note = resolve_id(cfg, suggested, "normal", "normal")
+            mem_picked, mem_note = resolve_id(cfg, suggested, "normal", "normal", catalogue=catalogue)
             if mem_picked and (not catalogue or mem_picked in catalogue):
                 picked_id = mem_picked
                 parsed = {
@@ -1890,7 +2155,7 @@ def main() -> int:
             if parsed is None:
                 reason = parse_err
             else:
-                picked_id, note = resolve_id(cfg, parsed["bucket"], parsed["latency"], parsed["effort"])
+                picked_id, note = resolve_id(cfg, parsed["bucket"], parsed["latency"], parsed["effort"], catalogue=catalogue)
                 if picked_id and (not catalogue or picked_id in catalogue):
                     reason = f"{parsed['reason']} | {note}"
                 else:
@@ -1901,7 +2166,7 @@ def main() -> int:
 
     if not picked_id:
         # Fall back: use default_bucket with normal latency/effort, then finally default_id.
-        fb_id, fb_note = resolve_id(cfg, default_bucket, "normal", "normal")
+        fb_id, fb_note = resolve_id(cfg, default_bucket, "normal", "normal", catalogue=catalogue)
         if fb_id and (not catalogue or fb_id in catalogue):
             picked_id = fb_id
             reason = (reason or err or "fallback") + f" | {fb_note}"

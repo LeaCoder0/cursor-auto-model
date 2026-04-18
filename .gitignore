@@ -14,6 +14,10 @@ cursor-auto.log
 memory.json
 memory.*.json
 
+# Per-model health / block list — operationally local (rate limits, outages).
+health.json
+health.*.json
+
 # Python bytecode
 __pycache__/
 *.pyc

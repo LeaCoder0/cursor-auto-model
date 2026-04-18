@@ -13,6 +13,7 @@ planner.
 - **Regex intent fast-path** — trivial prompts (greetings, typo fixes, `rename X to Y`, …) skip Ollama entirely (~70 ms).
 - **Agent role registry** — `agents/*.yaml` defines personas (`coder`, `reviewer`, `tester`, `architect`, `security-architect`, `doc-writer`). Planner picks one per task; orchestrator prepends the role's system prompt to `cursor-agent --print`.
 - **Learned routing memory** — `router.py --learn` distills `judge.log` into `memory.json`. With `ROUTER_MEMORY=1`, future routes for matching prompt signatures use the learned bucket override (~1 ms hit, no Ollama call).
+- **Multi-policy scorer** — every ladder candidate gets scored by `capability` (0.6) + `cost` (0.2) + `health` (0.2). Unhealthy models in `health.json` are gracefully skipped. `--score bucket/latency/effort` dumps the table.
 - **Optional LLM-as-judge** on a sample of runs for offline quality signal.
 - **Safe by default**: on any failure, falls back to a known-good model and exits 0.
 
@@ -137,6 +138,24 @@ export ROUTER_MEMORY=1
 | `ROUTER_MEMORY_MIN_AGREE` | `3` | Minimum independent judge votes required before learning an override |
 
 Memory is **read-only at runtime**. `--learn` is the only writer. Overrides require ≥`min_agree` independent judge agreements **and** a >60% majority on the suggested bucket — one angry verdict cannot rewrite the world.
+
+### Multi-policy scoring
+
+Replaces the old `ladder[tier]` index with a scored shortlist. Three policies vote (capability 0.6 + cost 0.2 + health 0.2); the winner is picked. Use `--score` to inspect the ranking offline:
+
+```bash
+$ python3 router.py --score --prompt 'coding_medium/normal/max'
+router: scored 13 candidate(s) for bucket=coding_medium latency=normal effort=max
+   #  id                        cap   cost  health  total  blocked
+   1  gpt-5.1-codex-max-medium  1.00  0.40  1.00   0.880  no
+   2  gpt-5.3-codex-high        0.70  0.40  1.00   0.700  no
+   ...
+```
+
+| Variable | Default | What it controls |
+|---|---|---|
+| `ROUTER_SCORING` | `1` | `0` falls back to the legacy `ladder[tier]` picker (kept as safety net) |
+| `ROUTER_HEALTH_FILE` | `./health.json` | Per-model block list. Schema: `{"version":1,"blocked":{"<id>":{"reason":"...", "until":"<ISO8601>"}}}`. `until` in the past is ignored; missing `until` = permanent block |
 
 ### Cache
 
